@@ -1,54 +1,79 @@
 import os
 import machine
 import gc
+import network
+import webrepl
+import time
 
-# 1. Приведение файловой системы в порядок
-files = os.listdir()
+# Функция подключения к Wi-Fi
+def do_connect():
+    wlan = network.WLAN(network.STA_IF)
+    if wlan.isconnected():
+        print("Уже в сети:", wlan.ifconfig())
+        return
+    wlan.active(True)
+    wlan.connect('4G-MIFI-533B', '1234567890')
+    for _ in range(10):
+        if wlan.isconnected(): break
+        time.sleep(1)
+    print('Network config:', wlan.ifconfig())
 
-# Если есть маркер теста (purgatory.txt), значит, предыдущее обновление 
-# прошло успешно. Удаляем маркер, так как плата загрузилась нормально.
-if "purgatory.txt" in files:
-    os.remove("purgatory.txt")
-    print("[BOOT] Система успешно загрузилась после обновления.")
+# Функция для безопасного чтения версии без импорта
+def get_version():
+    try:
+        with open("version.py", "r") as f:
+            content = f.read()
+            if "=" in content:
+                # Извлекаем значение после '=', убираем кавычки
+                return content.split("=")[1].replace('"', '').replace("'", "").strip()
+    except:
+        pass
+    return "0.0"
 
-# 2. Проверка: есть ли новое обновление?
-if "main_new.py" in files:
-    print("[BOOT] Обнаружено обновление...")
+do_connect()
+webrepl.start()
+
+FILES = os.listdir()
+
+# Локальная версия прошивки на плате (читаем файл, а не импортируем)
+current_version = get_version()
+print(f"[BOOT] Текущая версия системы: {current_version}")
+
+# 1. ЗАЩИТА И ОТКАТ: Проверяем маркер «испытательного срока»
+if "purgatory.txt" in FILES:
+    print("[BOOT] ВНИМАНИЕ: Новое обновление упало при запуске! Начинаем откат...")
     
-    # Делаем бэкап текущего рабочего файла, если он существует
-    if "main.py" in files:
-        if "main_backup.py" in files:
+    if "main.py" in FILES:
+        os.remove("main.py")
+        
+    if "main_backup.py" in FILES:
+        os.rename("main_backup.py", "main.py")
+        
+    os.remove("purgatory.txt")
+    print("[BOOT] Откат завершен. Восстановлена старая рабочая версия.")
+    machine.reset() # Перезагрузка после отката
+
+# 2. УСТАНОВКА ОБНОВЛЕНИЯ
+elif "main_new.py" in FILES:
+    print("[BOOT] Найдено свежее обновление. Подготовка...")
+    
+    # Делаем бэкап
+    if "main.py" in FILES:
+        if "main_backup.py" in FILES:
             os.remove("main_backup.py")
         os.rename("main.py", "main_backup.py")
-    
-    # Заменяем старый файл на новый
+        
+    # Устанавливаем новую прошивку
     os.rename("main_new.py", "main.py")
     
-    # Обновляем версию, если есть файл версии
-    if "version_new.py" in files:
-        if "version.py" in files:
-            os.remove("version.py")
+    # Устанавливаем новую версию
+    if "version_new.py" in FILES:
+        if "version.py" in FILES: os.remove("version.py")
         os.rename("version_new.py", "version.py")
         
-    # Ставим "испытательный маркер"
-    # Если на этом этапе (в main.py) произойдет сбой (например, ошибка в коде),
-    # этот файл останется, и при следующей перезагрузке мы сделаем откат.
+    # Ставим маркер
     with open("purgatory.txt", "w") as f:
         f.write("testing")
         
-    print("[BOOT] Обновление установлено. Перезапуск...")
-    machine.reset()
-
-# 3. Дополнительная защита: если произошел сбой и файл purgatory.txt остался
-elif "purgatory.txt" in files:
-    print("[BOOT] ОШИБКА ОБНОВЛЕНИЯ! Откат к старой версии...")
-    if "main.py" in files:
-        os.remove("main.py")
-    if "main_backup.py" in files:
-        os.rename("main_backup.py", "main.py")
-    os.remove("purgatory.txt")
-    machine.reset()
-
-# Если всё хорошо, просто продолжаем загрузку системы
-print("[BOOT] Запуск основной программы...")
-gc.collect()
+    print("[BOOT] Обновление установлено. Запуск в тестовом режиме...")
+    machine.reset() # Перезагрузка для применения
