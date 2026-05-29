@@ -5,9 +5,24 @@ import network
 import json
 import urequests
 import gc
+import version
+import sys
 
-# Определяем текущую версию системы
-VERSION = "1.1"
+def get_version_local():
+    try:
+        with open("version.py", "r") as f:
+            content = f.read()
+            # Ищем что-то типа VERSION = "1.2"
+            if "=" in content:
+                return content.split("=")[1].replace('"', '').replace("'", "").strip()
+    except:
+        pass
+    return "0.0"
+
+# Получаем версию как строку
+VERSION = get_version_local()
+print(f"[BOOT] Запуск основной программы, версия: {VERSION}")
+
 
 # ==============================================================================
 # НАСТРОЙКА ОБЛАКА
@@ -56,22 +71,65 @@ wiegand_buffer = []
 last_bit_time = 0
 last_pulse_us = 0                # Для фильтрации дребезга Wiegand
 
-def download_update_from_github(url):
-    print(f"[OTA] Скачивание обновления с: {url}")
+def download_file(url, target_filename, retries=3):
+    """Потоковая загрузка с повторными попытками при сбоях сети"""
+    for attempt in range(retries):
+        print(f"[OTA] Попытка {attempt + 1}/{retries}: Загрузка {target_filename}...")
+        gc.collect()
+        try:
+            # Увеличиваем таймаут для стабильности на слабых сетях
+            response = urequests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(target_filename, "wb") as f:
+                    while True:
+                        chunk = response.raw.read(512)
+                        if not chunk: break
+                        f.write(chunk)
+                response.close()
+                print(f"[OTA] {target_filename} успешно сохранен.")
+                return True
+            else:
+                print(f"[OTA] Ошибка сервера: {response.status_code}")
+        except Exception as e:
+            print(f"[OTA] Ошибка при скачивании (попытка {attempt + 1}): {e}")
+            time.sleep(2) # Пауза перед следующей попыткой
+    
+    print(f"[OTA] Не удалось скачать {target_filename} после {retries} попыток.")
+    return False
+
+def check_for_updates():
+    print("[OTA] Проверка обновлений...")
     try:
-        import urequests
-        response = urequests.get(url)
+        response = urequests.get("https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.py")
         if response.status_code == 200:
-            print("[OTA] Файл скачан, запись на флеш...")
-            with open("main_new.py", "w") as f:
-                f.write(response.text)
+            content = response.text.strip()
             response.close()
-            print("[OTA] Файл сохранен как main_new.py. Перезагрузка...")
-            machine.reset()
+            
+            # Извлекаем версию: ищем всё, что идет после знака '='
+            # Например: 'VERSION = "1.2"' -> '1.2'
+            if "=" in content:
+                # Берем правую часть, убираем кавычки и пробелы
+                new_version = content.split("=")[1].replace('"', '').replace("'", "").strip()
+            else:
+                new_version = content # Если файл содержит просто '1.2'
+
+            print(f"[OTA] Текущая версия: {VERSION}, на сервере: {new_version}")
+
+            if new_version != VERSION:
+                print(f"[OTA] Найдена новая версия. Обновляемся...")
+                
+                if download_file("https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py", "main_new.py"):
+                    # Сохраняем новую версию локально
+                    with open("version.py", "w") as f:
+                        f.write(f'VERSION = "{new_version}"')
+                    print("[OTA] Все файлы обновлены. Перезагрузка...")
+                    machine.reset()
+            else:
+                print("[OTA] Версия актуальна.")
         else:
             print(f"[OTA] Ошибка сервера: {response.status_code}")
     except Exception as e:
-        print(f"[OTA] Ошибка при скачивании: {e}")
+        print(f"[OTA] Ошибка при проверке: {e}")
         
 
 def beep(duration=0.1, count=1, error=False):
@@ -268,6 +326,8 @@ else:
 if "purgatory.txt" in os.listdir():
     os.remove("purgatory.txt")
 
+check_for_updates()
+
 # ==============================================================================
 # ОСНОВНОЙ РАБОЧИЙ ЦИКЛ СТАНЦИИ
 # ==============================================================================
@@ -375,3 +435,4 @@ while True:
             time.sleep(2.0)
             
     time.sleep_ms(20)
+

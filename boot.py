@@ -41,16 +41,11 @@ print(f"[BOOT] Текущая версия системы: {current_version}")
 
 # 1. ЗАЩИТА И ОТКАТ: Проверяем маркер «испытательного срока»
 if "purgatory.txt" in FILES:
-    print("[BOOT] ВНИМАНИЕ: Новое обновление упало при запуске! Начинаем откат...")
-    
-    if "main.py" in FILES:
-        os.remove("main.py")
-        
-    if "main_backup.py" in FILES:
-        os.rename("main_backup.py", "main.py")
-        
+    print("[BOOT] ВНИМАНИЕ: Новое обновление упало!")
+    if "main.py" in FILES: os.remove("main.py")
+    if "main_backup.py" in FILES: os.rename("main_backup.py", "main.py")
     os.remove("purgatory.txt")
-    print("[BOOT] Откат завершен. Восстановлена старая рабочая версия.")
+    print("[BOOT] Откат завершен. Продолжаем загрузку...")
     machine.reset() # Перезагрузка после отката
 
 # 2. УСТАНОВКА ОБНОВЛЕНИЯ
