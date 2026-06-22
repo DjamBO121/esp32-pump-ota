@@ -1,438 +1,230 @@
-from machine import Pin, SoftSPI, SoftI2C
-import os
+from machine import Pin, UART, PWM, I2C, SPI
 import time
-import network
-import json
-import urequests
-import gc
-import version
-import sys
+import os
+from ds3231 import DS3231
+from sdcard import SDCard
 
-def get_version_local():
-    try:
-        with open("version.py", "r") as f:
-            content = f.read()
-            # Ищем что-то типа VERSION = "1.2"
-            if "=" in content:
-                return content.split("=")[1].replace('"', '').replace("'", "").strip()
-    except:
-        pass
-    return "0.0"
+# --- Настройки ---
+reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
+uart = UART(2, baudrate=9600, tx=17, rx=16)
+i2c = I2C(0, scl=Pin(22), sda=Pin(21))
+rtc = DS3231(i2c)
+relay = Pin(25, Pin.OUT)
+green_led = Pin(15, Pin.OUT)
+red_led = Pin(13, Pin.OUT)
+buzzer = Pin(14, Pin.OUT)
+flow_sensor = Pin(32, Pin.IN, Pin.PULL_UP)
 
-# Получаем версию как строку
-VERSION = get_version_local()
-print(f"[BOOT] Запуск основной программы, версия: {VERSION}")
+try:
+    status = i2c.readfrom_mem(0x68, 0x0F, 1)[0]
+    i2c.writeto_mem(0x68, 0x0F, bytes([status & 0x7F]))
+except Exception as e:
+    print("Ошибка при сбросе флага RTC:", e)
+
+# Состояния
+is_fueling = False
+flow_pulses = 0
+last_pulse_time = 0
+current_car_num = ""
+current_card = ""
+sd_mounted=False
+last_card_id = ""
+last_read_time = 0
+relay.value(0)
+green_led.value(1)
+red_led.value(1)
+emergency_flag = False
+last_press_time = 0
 
 
-# ==============================================================================
-# НАСТРОЙКА ОБЛАКА
-# ==============================================================================
-GOOGLE_SCR_URL = "https://script.google.com/macros/s/AKfycbyZ5EGJND9ojdwtXGyHQD9AiTBIZNNkggA0OnEEMFzhUcRpQ-cqx3Ss35XwCrQAA9t_/exec"
+def emergency_reset(pin):
+    global emergency_flag, last_press_time
+    current_time = time.ticks_ms()
+    # Если нажатие было менее 500мс назад, игнорируем (защита от помех)
+    if time.ticks_diff(current_time, last_press_time) > 500:
+        red_led.value(0)
+        emergency_flag = True
+        last_press_time = current_time
+reset_btn.irq(trigger=Pin.IRQ_FALLING, handler=emergency_reset)
 
-# ==============================================================================
-# НАСТРОЙКИ ПИНОВ И ОБОРУДОВАНИЯ
-# ==============================================================================
-PIN_SDA, PIN_SCL = 21, 22       # Часы DS3231 (I2C)
-
-# Конфигурация MicroSD карты (SPI)
-PIN_MISO = 4
-PIN_MOSI = 2
-PIN_CS   = 18
-PIN_SCK  = 5
-
-PIN_D0, PIN_D1 = 26, 27         # Считыватель карт Wiegand
-PIN_RELAY, PIN_BUZZER = 25, 14  # Реле и Зуммер
-
-# Двухцветный светодиод считывателя
-PIN_LED_RED   = 13              # Красный светодиод
-PIN_LED_GREEN = 15              # Зеленый светодиод
-
-PIN_FLOW_SENSOR = 32            # Сигнальный провод расходомера
-PULSES_PER_LITER = 60.0         # Коэффициент расходомера (импульсов на 1 литр)
-
-# ==============================================================================
-# ИНИЦИАЛИЗАЦИЯ ЖЕЛЕЗА
-# ==============================================================================
-relay  = Pin(PIN_RELAY, Pin.OUT, value=0)
-buzzer = Pin(PIN_BUZZER, Pin.OUT, value=0)
-
-# Настройка светодиодов: при старте горит КРАСНЫЙ (0), ЗЕЛЕНЫЙ потушен (1)
-led_r  = Pin(PIN_LED_RED, Pin.OUT, value=0)
-led_g  = Pin(PIN_LED_GREEN, Pin.OUT, value=1)
-
-# Настройка часов I2C
-i2c = SoftI2C(sda=Pin(PIN_SDA), scl=Pin(PIN_SCL))
-
-# Настройка расходомера
-flow_pin = Pin(PIN_FLOW_SENSOR, Pin.IN, Pin.PULL_UP)
-
-pulse_count = 0
-wiegand_buffer = []
-last_bit_time = 0
-last_pulse_us = 0                # Для фильтрации дребезга Wiegand
-
-def download_file(url, target_filename, retries=3):
-    """Потоковая загрузка с повторными попытками при сбоях сети"""
-    for attempt in range(retries):
-        print(f"[OTA] Попытка {attempt + 1}/{retries}: Загрузка {target_filename}...")
-        gc.collect()
-        try:
-            # Увеличиваем таймаут для стабильности на слабых сетях
-            response = urequests.get(url, stream=True)
-            if response.status_code == 200:
-                with open(target_filename, "wb") as f:
-                    while True:
-                        chunk = response.raw.read(512)
-                        if not chunk: break
-                        f.write(chunk)
-                response.close()
-                print(f"[OTA] {target_filename} успешно сохранен.")
-                return True
-            else:
-                print(f"[OTA] Ошибка сервера: {response.status_code}")
-        except Exception as e:
-            print(f"[OTA] Ошибка при скачивании (попытка {attempt + 1}): {e}")
-            time.sleep(2) # Пауза перед следующей попыткой
-    
-    print(f"[OTA] Не удалось скачать {target_filename} после {retries} попыток.")
-    return False
-
-def check_for_updates():
-    print("[OTA] Проверка обновлений...")
-    try:
-        response = urequests.get("https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.py")
-        if response.status_code == 200:
-            content = response.text.strip()
-            response.close()
-            
-            # Извлекаем версию: ищем всё, что идет после знака '='
-            # Например: 'VERSION = "1.2"' -> '1.2'
-            if "=" in content:
-                # Берем правую часть, убираем кавычки и пробелы
-                new_version = content.split("=")[1].replace('"', '').replace("'", "").strip()
-            else:
-                new_version = content # Если файл содержит просто '1.2'
-
-            print(f"[OTA] Текущая версия: {VERSION}, на сервере: {new_version}")
-
-            if new_version != VERSION:
-                print(f"[OTA] Найдена новая версия. Обновляемся...")
-                
-                if download_file("https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py", "main_new.py"):
-                    # Сохраняем новую версию локально
-                    with open("version.py", "w") as f:
-                        f.write(f'VERSION = "{new_version}"')
-                    print("[OTA] Все файлы обновлены. Перезагрузка...")
-                    machine.reset()
-            else:
-                print("[OTA] Версия актуальна.")
-        else:
-            print(f"[OTA] Ошибка сервера: {response.status_code}")
-    except Exception as e:
-        print(f"[OTA] Ошибка при проверке: {e}")
-        
-
-def beep(duration=0.1, count=1, error=False):
-    """Функция звувого сигнала с поддержкой мигания светодиодов"""
-    for _ in range(count):
-        buzzer.value(1)
-        if error:
-            led_r.value(1)      # Подмигиваем красным при ошибке
-        else:
-            led_g.value(0)      # Подмигиваем зеленым при успехе
-            
-        time.sleep(duration)
-        buzzer.value(0)
-        
-        if error:
-            led_r.value(0)
-        else:
-            led_g.value(1)
-        time.sleep(0.05)
-
-# Прерывание для расходомера
-def flow_pulse_callback(pin):
-    global pulse_count
-    pulse_count += 1
-
-flow_pin.irq(trigger=Pin.IRQ_FALLING, handler=flow_pulse_callback)
-
-# Прерывание для считывателя карт с фильтром помех на 30 мкс
-def wiegand_edge_callback(pin):
-    global last_bit_time, last_pulse_us
-    now_us = time.ticks_us()
-    
-    if time.ticks_diff(now_us, last_pulse_us) < 30:
-        return
-    last_pulse_us = now_us
-    
-    last_bit_time = time.ticks_ms()
-    wiegand_buffer.append(0 if pin == d0_pin else 1)
-
-d0_pin = Pin(PIN_D0, Pin.IN, Pin.PULL_UP)
-d1_pin = Pin(PIN_D1, Pin.IN, Pin.PULL_UP)
-d0_pin.irq(trigger=Pin.IRQ_FALLING, handler=wiegand_edge_callback)
-d1_pin.irq(trigger=Pin.IRQ_FALLING, handler=wiegand_edge_callback)
-
-# ==============================================================================
-# ФУНКЦИЯ МОНТИРОВАНИЯ SD КАРТЫ
-# ==============================================================================
-sd_mounted = False
-
-def try_mount_sd():
+def mount_sd():
     global sd_mounted
-    print("Монтирование карты памяти...")
-    time.sleep(0.5)  # Стабилизация питания
     try:
-        import sdcard
-        spi = SoftSPI(baudrate=400000, polarity=0, phase=0, sck=Pin(PIN_SCK), mosi=Pin(PIN_MOSI), miso=Pin(PIN_MISO))
-        sd = sdcard.SDCard(spi, Pin(PIN_CS))
-        vfs = os.VfsFat(sd)
-        os.mount(vfs, "/sd")
-        print(" -> Карта памяти успешно подключена к системе!")
-        sd_mounted = True
+        spi = SPI(1, baudrate=1000000, sck=Pin(18), mosi=Pin(23), miso=Pin(19))
+        cs = Pin(5, Pin.OUT)
+        os.mount(SDCard(spi, cs), '/sd')
+        print("SD карта смонтирована.")
+        sd_mounted=True
         return True
     except Exception as e:
         print(f" -> КРИТИЧЕСКАЯ ОШИБКА КАРТЫ: {e}")
-        sd_mounted = False
+        sd_mounted=False
         return False
 
-# Первая попытка при старте платы
-try_mount_sd()
+mount_sd()
 
-# ==============================================================================
-# ФУНКЦИИ РАБОТЫ С ДАННЫМИ
-# ==============================================================================
-def get_rtc_time_str():
+def play_tone(duration):
+    buzzer.value(1) # Подаем 3.3В - он пищит сам
+    time.sleep(duration)
+    buzzer.value(0) # Выключаем
+
+def play_success():
+    # Два коротких сигнала успеха
+    play_tone(0.1)
+    time.sleep(0.1)
+    play_tone(0.1)
+    green_led.value(0)
+
+def play_decline():
+    # Один длинный сигнал ошибки
+    play_tone(0.6)
+    red_led.value(0)
+    time.sleep(3)
+    red_led.value(1)
+def count_pulse(p):
+    global flow_pulses, last_pulse_time
+    if is_fueling:
+        flow_pulses += 1
+        last_pulse_time = time.time()
+
+flow_sensor.irq(trigger=Pin.IRQ_FALLING, handler=count_pulse)
+
+def get_allowed_user(card_id):
+    # Очищаем ID от всего, кроме цифр
+    target_id = "".join([c for c in card_id if c.isdigit()])
+    print(f"DEBUG: Ищем в базе строго цифры: '{target_id}'")
+    
     try:
-        data = i2c.readfrom_mem(0x68, 0x00, 7)
-        sec = ((data[0] >> 4) * 10) + (data[0] & 0x0F)
-        minute = ((data[1] >> 4) * 10) + (data[1] & 0x0F)
-        hour = ((data[2] >> 4) * 10) + (data[2] & 0x0F)
-        day = ((data[4] >> 4) * 10) + (data[4] & 0x0F)
-        month = ((data[5] >> 4) * 10) + (data[5] & 0x0F)
-        year = 2000 + ((data[6] >> 4) * 10) + (data[6] & 0x0F)
-        return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{sec:02d}"
-    except:
-        return "Время неизвестно"
+        with open('/sd/users.txt', 'r') as f:
+            for line in f:
+                # Очищаем строку из файла от всего, кроме цифр и запятых
+                clean_line = line.strip()
+                if ',' not in clean_line:
+                    continue
+                
+                parts = clean_line.split(',')
+                file_id = "".join([c for c in parts[0] if c.isdigit()])
+                car_num = parts[1].strip()
+                
+                # Сравниваем только очищенные цифры
+                if file_id == target_id:
+                    print(f"DEBUG: НАШЛИ! ID={file_id}, Машина={car_num}")
+                    return car_num
+                    
+                # Печатаем для диагностики, с чем сравниваем
+                # print(f"DEBUG: Сравниваем '{target_id}' с '{file_id}'")
+                
+    except Exception as e:
+        print("Ошибка при чтении файла:", e)
+    
+    print(f"DEBUG: Карта {target_id} не найдена в базе!")
+    return None
 
-def check_driver_access(card_id):
+def log_transaction(card_id, car_num, liters):
     if not sd_mounted:
         return None
-    driver_name = None
+    t = rtc.datetime()
+    ts = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:3], *t[4:7])
     try:
-        if "drivers.csv" in os.listdir("/sd"):
-            with open("/sd/drivers.csv", "r") as f:
-                for line in f:
-                    if line.strip():
-                        parts = line.strip().split(",")
-                        if len(parts) >= 2 and parts[0].strip() == str(card_id).strip():
-                            driver_name = parts[1].strip()
-                            break
-    except Exception as e:
-        print("Ошибка при чтении файла водителей:", e)
-    return driver_name
+        with open('/sd/log.csv', 'a') as f:
+            f.write(f"{ts};{card_id};{car_num};{liters:.2f}\n")
+    except:
+        print("Ошибка записи лога")
 
-def log_fuel_transaction(card_id, driver, liters):
-    if not sd_mounted:
-        return
-    timestamp = get_rtc_time_str() 
-    try:
-        with open("/sd/fuel_log.txt", "a") as f:
-            f.write(f"[{timestamp}] Карта: {card_id} | Водитель: {driver} | Пролито: {liters:.2f} л.\n")
-        print(f"-> Успешно записано в лог: [{timestamp}] - {liters:.2f} л.")
-    except Exception as e:
-        print("Ошибка записи локального лога:", e)
+# --- Основной цикл ---
+print("Система готова.")
 
-def send_to_google_sheets(card_id, driver_name, liters):
-    """Отправка транзакции в облако Google с исправленным расчетом длины UTF-8"""
-    if not GOOGLE_SCR_URL:
-        print("[ОБЛАКО] Ссылка пустая. Пропуск отправки.")
-        return False
-    try:
-        url = GOOGLE_SCR_URL.strip().replace('\xa0', '')
-        host = "script.google.com"
-        path = url.split(host)[1]
-        timestamp = get_rtc_time_str()
-        
-        # Строго упаковываем JSON и превращаем его в БАЙТЫ, чтобы корректно измерить длину
-        payload = {"command": "log_fuel",
-                   "card_id": str(card_id),
-                   "driver": str(driver_name),
-                   "liters": float(liters),
-                   "fueling_time": timestamp}
-        body_bytes = json.dumps(payload).encode('utf-8')
-        
-        import usocket as socket
-        try: import ssl
-        except: import ussl as ssl
-        
-        print("[ОБЛАКО ДЕБАГ] 1. Разрешаем DNS...")
-        ai = socket.getaddrinfo(host, 443)
-        addr = ai[0][-1]
-        
-        s = socket.socket()
-        s.settimeout(30.0)
-        
-        print("[ОБЛАКО ДЕБАГ] 2. Подключаемся к серверу...")
-        s.connect(addr)
-        
-        gc.collect() 
-        
-        print("[ОБЛАКО ДЕБАГ] 3. Создаем SSL-туннель с поддержкой SNI...")
-        s = ssl.wrap_socket(s, server_hostname=host)
-        
-        # Формируем заголовки. Длину берем строго от СКОМПИЛИРОВАННЫХ БАЙТ, а не от текста!
-        header = (
-            f"POST {path} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"Content-Type: application/json; charset=utf-8\r\n"
-            f"Content-Length: {len(body_bytes)}\r\n"
-            f"Connection: close\r\n\r\n"
-        )
-        
-        print("[ОБЛАКО ДЕБАГ] 4. Отправляем данные...")
-        # Отправляем порционно: сначала заголовки, затем тело запроса. Так ESP32 не зависнет по памяти
-        s.write(header.encode('utf-8'))
-        s.write(body_bytes)
-        
-        print("[ОБЛАКО ДЕБАГ] 5. Ждем ответ от Google...")
-        response_line = s.readline().decode('utf-8')
-        s.close()
-        
-        gc.collect()
-        
-        print("[ОБЛАКО] Статус сервера Google:", response_line.strip())
-        if "302" in response_line or "200" in response_line:
-            print("[ОБЛАКО] Данные успешно сохранены в Google Sheets!")
-            return True
-        return False
-    except Exception as e:
-        print("[ОБЛАКО] Критическая ошибка сети при отправке:", e)
-        return False
+while sd_mounted:
     
-# ==============================================================================
-# ИНИЦИАЛИЗАЦИЯ СЕТИ С ЗАПРЕТОМ РЕЖИМА СНА
-# ==============================================================================
-beep(0.1, 2)
-wlan = network.WLAN(network.STA_IF)
-
-if wlan.isconnected():
-    print(f"Плата успешно подхватила сеть! IP: {wlan.ifconfig()[0]}")
-    wlan.config(pm=network.WLAN.PM_NONE) # Wi-Fi не уснет во время пролива
-else:
-    print("ВНИМАНИЕ: Wi-Fi не подключен. Работаем автономно.")
-
-if "purgatory.txt" in os.listdir():
-    os.remove("purgatory.txt")
-
-check_for_updates()
-
-# ==============================================================================
-# ОСНОВНОЙ РАБОЧИЙ ЦИКЛ СТАНЦИИ
-# ==============================================================================
-print("\n=== АВТОМАТ ЗАПРАВКИ v" + VERSION + " НАДЕЖНО ЗАПУЩЕН И ГОТОВ ===")
-
-while True:
-    # ОСВОБОЖДАЕМ ПАМЯТЬ: Каждые 20мс в простое вычищаем накопившийся мусор в ОЗУ
-    gc.collect()
-    
-    # Ждем окончания передачи пакета данных Wiegand
-    if wiegand_buffer and (time.ticks_ms() - last_bit_time > 50):
-        bits_count = len(wiegand_buffer)
+    if emergency_flag:
+        emergency_flag = False
+        print("\n!!! АВАРИЙНЫЙ ПЕРЕХВАТ !!!")
+        if is_fueling:
+            liters = flow_pulses / 60
+            if liters > 0.01:
+                log_transaction(current_card, current_car_num, liters)
+            print(f"Данные сохранены: {liters:.2f} л.")
         
-        if bits_count != 26 and bits_count != 34:
-            print(f"\n[WIEGAND ДЕБАГ] Ошибка: Считано {bits_count} бит. Очистка.")
-            wiegand_buffer.clear()
-            continue
+        print("Перезагрузка...")
+        time.sleep(0.5)
+        import machine
+        machine.reset()
+        
+    if not is_fueling:
+        if uart.any():
+            time.sleep(0.05)
+            data = uart.read()
+            # Очистка буфера от "мусора"
+            while uart.any(): uart.read()
             
-        card_code = 0
-        for bit in wiegand_buffer:
-            card_code = (card_code << 1) | bit
-        wiegand_buffer.clear()
-        
-        print(f"\nСчитана карта: {card_code}")
-        
-        # ----------------------------------------------------------------------
-        # КРИТИЧЕСКИЙ БЛОК ПРОВЕРКИ SD КАРТЫ ПЕРЕД ЗАПРАВКОЙ
-        # ----------------------------------------------------------------------
-        if not sd_mounted:
-            print("[БЛОКИРОВКА] Попытка аварийного переподключения SD карты...")
-            if not try_mount_sd():
-                print("[ОТКАЗ] Заправка заблокирована: Локальная база данных и логи недоступны!")
-                beep(0.08, 5, error=True)
-                continue 
-        # ----------------------------------------------------------------------
-        
-        driver = check_driver_access(card_code)
-        
-        if driver:
-            print(f"ДОСТУП РАЗРЕШЕН! Водитель: {driver}")
-            led_r.value(1)
-            led_g.value(0)
-            beep(0.3, 1)
+            data_str = data.decode('ascii', 'ignore')
+            hex_part = "".join([c for c in data_str if c in "0123456789ABCDEFabcdef"])
             
-            relay.value(1) # ЗАПУСК НАСОСА
-            print("Насос включен. Ожидание пролива...")
-            
-            pulse_count = 0
-            start_waiting_time = time.ticks_ms()
-            last_flow_time = time.ticks_ms()
-            last_pulse_check = 0
-            fueling_started = False
-            
-            while True:
-                current_pulses = pulse_count
-                liters = current_pulses / PULSES_PER_LITER
+            if len(hex_part) >= 12:
+                card_id = "{:010d}".format(int(hex_part[4:10], 16))
                 
-                if current_pulses > 0 and current_pulses != last_pulse_check:
-                    if not fueling_started:
-                        print("\nПролив пошел!")
-                        fueling_started = True
-                    print(f"Налито: {liters:.2f} л. (Импульсов: {current_pulses})", end="\r")
-                    last_flow_time = time.ticks_ms()
-                    last_pulse_check = current_pulses
-                    
-                if not fueling_started and (time.ticks_ms() - start_waiting_time > 15000):
-                    print("\n[ТАЙМАУТ] Отмена: нет пролива в течение 15 секунд.")
-                    break
-                    
-                if fueling_started and (time.ticks_ms() - last_flow_time > 8000):
-                    print("\nПролив прекратился (пистолет закрыт).")
-                    break
-                        
-                time.sleep_ms(50)
-            
-            # Заправка окончена
-            relay.value(0)
-            time.sleep(15.0)
-            led_g.value(1)
-            led_r.value(0)
-            
-            final_liters = pulse_count / PULSES_PER_LITER
-            print(f"Заправка окончена. Итого налито: {final_liters:.2f} литров.")
-            
-            if final_liters > 0.01:
-                log_fuel_transaction(card_code, driver, final_liters)
+                current_time = time.time()
+                if card_id == last_card_id and (current_time - last_read_time < 2):
+                    continue
                 
-                cloud_sent = False
-                if wlan.isconnected():
-                    cloud_sent = send_to_google_sheets(card_code, driver, final_liters)
+                last_card_id = card_id
+                last_read_time = current_time
                 
-                if cloud_sent:
-                    beep(0.1, 3)
+                if not sd_mounted:
+                    print("[БЛОКИРОВКА] Попытка аварийного переподключения SD карты...")
+                    if not mount_sd():
+                        print("[ОТКАЗ] Заправка заблокирована: Локальная база данных и логи недоступны!")
+                        play_decline()
+                        continue
+                
+                car_num = get_allowed_user(card_id)
+                if car_num:
+                    print("Разрешено:", car_num)
+                    relay.value(1)
+                    play_success()
+                    current_card, current_car_num = card_id, car_num
+                    flow_pulses = 0
+                    is_fueling = True
+                    last_pulse_time = time.time()
                 else:
-                    print("[СИСТЕМА] Сохранено только локально на SD. Нет связи с Google.")
-                    beep(0.1, 1)
-            else:
-                beep(0.2, 1)
+                    print("Доступ запрещен!")
+                    play_decline()
+    else:
+        # Логика заправки
+        # Если прошло более 10 секунд после последнего импульса
+        if time.time() - last_pulse_time > 10:
+            relay.value(0)
+            green_led.value(1)
+            liters = flow_pulses/60
+            is_fueling = False
+            
+            if liters > 0.01:
+                log_transaction(current_card, current_car_num, liters)
+            if emergency_flag:
+                import machine
+                machine.reset()
+                emergency_flag= False
+            print("Заправка завершена. Ожидание удаления карты...")
+            time.sleep(3)
+            last_card_id = ""
+            
+            print(f"Заправка завершена. Литров: {liters:.2f}")
+            
+            start_wait = time.time()
+            while True:
+                if emergency_flag:
+                    import machine
+                    machine.reset()
+                if uart.any():
+                    uart.read()
+                    start_wait = time.time() # Обновляем время, если считыватель "кричит"
                 
-            print("\nСтанция готова к новым картам.")
+                # Если прошло 2 секунды тишины от считывателя - значит карту убрали
+                if time.time() - start_wait > 1:
+                    break
+                time.sleep(0.1)
             
-        else:
-            print("ДОСТУП ЗАПРЕЩЕН: Карты нет в базе данных!")
-            beep(0.1, 4, error=True)
-            time.sleep(2.0)
+            last_card_id = "" # Теперь можно сбросить
+            print("Карта убрана. Готов к работе.")
             
-    time.sleep_ms(20)
-
+    time.sleep(0.1)
