@@ -3,7 +3,7 @@ import time
 import os
 from ds3231 import DS3231
 from sdcard import SDCard
-
+#dfs dfs fsdfskg perfect nice
 # --- Настройки ---
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
