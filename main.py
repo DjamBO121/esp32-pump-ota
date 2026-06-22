@@ -3,7 +3,9 @@ import time
 import os
 from ds3231 import DS3231
 from sdcard import SDCard
-#dfs dfs fsdfskg perfect nice
+import network
+import urequests
+#sdfkljfl;jsdl;jfl;jds;lkjfjsd;ljfl;jdsl;kjflkjsdl;jf;lsdaj;lfjsa
 # --- Настройки ---
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
@@ -36,7 +38,36 @@ red_led.value(1)
 emergency_flag = False
 last_press_time = 0
 
-
+def run_ota_check():
+    print("Проверка наличия обновлений...")
+    # Здесь используйте ту функцию get_web_text (или проверенный метод), 
+    # которая у вас заработала в boot.py
+    
+    # 1. Получаем удаленную версию
+    remote_ver = get_web_text("https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.txt")
+    
+    # 2. Читаем локальную
+    try:
+        with open('version.txt', 'r') as f: local_ver = f.read().strip()
+    except: local_ver = "0"
+        
+    if remote_ver and remote_ver != local_ver:
+        print(f"Найдено обновление {remote_ver}. Скачиваю...")
+        # Скачиваем новый main.py (используйте ваш метод записи через tmp-файл)
+        # ... код скачивания ...
+        # После успешной записи:
+        with open('version.txt', 'w') as f: f.write(remote_ver)
+        print("Обновление установлено. Перезагрузка.")
+        machine.reset()
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+if wlan.isconnected():
+    run_ota_check()
+    
+if not wlan.isconnected():
+    print("Сеть пропала, пытаюсь восстановить...")
+    wlan.connect("4G-MIFI-533B", "1234567890")
+    
 def emergency_reset(pin):
     global emergency_flag, last_press_time
     current_time = time.ticks_ms()
