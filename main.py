@@ -35,8 +35,6 @@ sd_mounted=False
 last_card_id = ""
 last_read_time = 0
 relay.value(0)
-green_led.value(1)
-red_led.value(1)
 emergency_flag = False
 last_press_time = 0
 
@@ -208,7 +206,6 @@ def main():
     print("Запуск основной программы...")
     global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card
     global sd_mounted, last_card_id, last_read_time, emergency_flag, last_press_time
-    # 1. Фоновая проверка обновлений (один раз при старте)
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
         try:
@@ -218,7 +215,8 @@ def main():
     
     # 2. ОСНОВНОЙ ЦИКЛ (здесь ваш код насоса/управления)
     print("Система готова.")
-
+    green_led.value(1)
+    red_led.value(1)
     while sd_mounted:
         
         if emergency_flag:
@@ -226,6 +224,7 @@ def main():
             print("\n!!! АВАРИЙНЫЙ ПЕРЕХВАТ !!!")
             if is_fueling:
                 liters = flow_pulses / 60
+                relay.value(0)
                 if liters > 0.01:
                     log_transaction(current_card, current_car_num, liters)
                 print(f"Данные сохранены: {liters:.2f} л.")
@@ -320,4 +319,6 @@ if __name__ == "__main__":
         run_ota_check()
     except Exception as e:
         print("Обновление не удалось:", e)
+    
+    # Запускаем основной бесконечный цикл
     main()
