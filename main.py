@@ -5,9 +5,9 @@ from ds3231 import DS3231
 from sdcard import SDCard
 import urequests
 import network, socket, ssl, gc, machine
-#fjhsdkjhsjhlh
+
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
-#lskdjfj
+
 # --- Настройки ---
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
@@ -214,9 +214,10 @@ def main():
         if emergency_flag:
             emergency_flag = False
             print("\n!!! АВАРИЙНЫЙ ПЕРЕХВАТ !!!")
+            relay.value(0)
+            green_led.value(1)
             if is_fueling:
                 liters = flow_pulses / 60
-                relay.value(0)
                 if liters > 0.01:
                     log_transaction(current_card, current_car_num, liters)
                 print(f"Данные сохранены: {liters:.2f} л.")
