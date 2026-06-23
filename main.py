@@ -3,9 +3,11 @@ import time
 import os
 from ds3231 import DS3231
 from sdcard import SDCard
-import network
 import urequests
-#sdfkljfl;jsdl;jfl;jds;lkjfjsd;ljfl;jdsl;kjflkjsdl;jf;lsdaj;lfjsa
+import network, socket, ssl, gc, machine
+
+MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
+
 # --- Настройки ---
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
@@ -38,36 +40,76 @@ red_led.value(1)
 emergency_flag = False
 last_press_time = 0
 
+def get_web_text(url):
+    gc.collect()
+    parts = url.split('/')
+    host = parts[2]
+    path = '/' + '/'.join(parts[3:])
+    
+    try:
+        s = socket.socket()
+        s.settimeout(10.0)
+        addr = socket.getaddrinfo(host, 443)[0][-1]
+        s.connect(addr)
+        s = ssl.wrap_socket(s, server_hostname=host)
+        s.write(b"GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n" % (path, host))
+        
+        res = b""
+        while True:
+            data = s.read(128)
+            if not data: break
+            res += data
+        s.close()
+        return res.split(b"\r\n\r\n", 1)[1].decode().strip()
+    except Exception as e:
+        print("Ошибка сети:", e)
+        return None
+
 def run_ota_check():
     print("Проверка наличия обновлений...")
-    # Здесь используйте ту функцию get_web_text (или проверенный метод), 
-    # которая у вас заработала в boot.py
+    import time
+    url = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.txt?t=" + str(time.time())
+    remote_ver = get_web_text(url)
+    if remote_ver is None: # Явно проверяем на None
+        print("Не удалось получить версию, пропускаем обновление.")
+        return
     
-    # 1. Получаем удаленную версию
-    remote_ver = get_web_text("https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.txt")
-    
-    # 2. Читаем локальную
+    remote_ver = remote_ver.strip()
     try:
         with open('version.txt', 'r') as f: local_ver = f.read().strip()
     except: local_ver = "0"
         
-    if remote_ver and remote_ver != local_ver:
-        print(f"Найдено обновление {remote_ver}. Скачиваю...")
-        # Скачиваем новый main.py (используйте ваш метод записи через tmp-файл)
-        # ... код скачивания ...
-        # После успешной записи:
-        with open('version.txt', 'w') as f: f.write(remote_ver)
-        print("Обновление установлено. Перезагрузка.")
+    if remote_ver.strip() == local_ver:
+        return
+
+    print(f"Найдено обновление {remote_ver}. Скачиваю...")
+    
+    # 3. Скачиваем новый код во временный файл main.new
+    code = get_web_text(MAIN_URL)
+    
+    # Проверка: получили ли мы вообще данные?
+    if code and len(code) > 100: # 100 байт - защита от пустого ответа
+        with open('main.new', 'w') as f:
+            f.write(code)
+        
+        # 4. Безопасная подмена
+        if 'main.py' in os.listdir():
+            if 'main.old' in os.listdir():
+                os.remove('main.old') # Удаляем старый бэкап
+            os.rename('main.py', 'main.old')
+        
+        os.rename('main.new', 'main.py')
+        
+        # 5. Обновляем версию
+        with open('version.txt', 'w') as f:
+            f.write(remote_ver)
+            
+        print("Обновление успешно. Перезагрузка.")
         machine.reset()
-wlan = network.WLAN(network.STA_IF)
-wlan.active(True)
-if wlan.isconnected():
-    run_ota_check()
-    
-if not wlan.isconnected():
-    print("Сеть пропала, пытаюсь восстановить...")
-    wlan.connect("4G-MIFI-533B", "1234567890")
-    
+    else:
+        print("Ошибка: скачанный файл пуст или поврежден.")
+
+
 def emergency_reset(pin):
     global emergency_flag, last_press_time
     current_time = time.ticks_ms()
@@ -162,100 +204,120 @@ def log_transaction(card_id, car_num, liters):
     except:
         print("Ошибка записи лога")
 
-# --- Основной цикл ---
-print("Система готова.")
-
-while sd_mounted:
+def main():
+    print("Запуск основной программы...")
+    global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card
+    global sd_mounted, last_card_id, last_read_time, emergency_flag, last_press_time
+    # 1. Фоновая проверка обновлений (один раз при старте)
+    wlan = network.WLAN(network.STA_IF)
+    if wlan.isconnected():
+        try:
+            run_ota_check()
+        except Exception as e:
+            print("Ошибка при фоновой проверке обновлений:", e)
     
-    if emergency_flag:
-        emergency_flag = False
-        print("\n!!! АВАРИЙНЫЙ ПЕРЕХВАТ !!!")
-        if is_fueling:
-            liters = flow_pulses / 60
-            if liters > 0.01:
-                log_transaction(current_card, current_car_num, liters)
-            print(f"Данные сохранены: {liters:.2f} л.")
+    # 2. ОСНОВНОЙ ЦИКЛ (здесь ваш код насоса/управления)
+    print("Система готова.")
+
+    while sd_mounted:
         
-        print("Перезагрузка...")
-        time.sleep(0.5)
-        import machine
-        machine.reset()
-        
-    if not is_fueling:
-        if uart.any():
-            time.sleep(0.05)
-            data = uart.read()
-            # Очистка буфера от "мусора"
-            while uart.any(): uart.read()
+        if emergency_flag:
+            emergency_flag = False
+            print("\n!!! АВАРИЙНЫЙ ПЕРЕХВАТ !!!")
+            if is_fueling:
+                liters = flow_pulses / 60
+                if liters > 0.01:
+                    log_transaction(current_card, current_car_num, liters)
+                print(f"Данные сохранены: {liters:.2f} л.")
             
-            data_str = data.decode('ascii', 'ignore')
-            hex_part = "".join([c for c in data_str if c in "0123456789ABCDEFabcdef"])
+            print("Перезагрузка...")
+            time.sleep(0.5)
+            import machine
+            machine.reset()
             
-            if len(hex_part) >= 12:
-                card_id = "{:010d}".format(int(hex_part[4:10], 16))
+        if not is_fueling:
+            if uart.any():
+                time.sleep(0.05)
+                data = uart.read()
+                # Очистка буфера от "мусора"
+                while uart.any(): uart.read()
                 
-                current_time = time.time()
-                if card_id == last_card_id and (current_time - last_read_time < 2):
-                    continue
+                data_str = data.decode('ascii', 'ignore')
+                hex_part = "".join([c for c in data_str if c in "0123456789ABCDEFabcdef"])
                 
-                last_card_id = card_id
-                last_read_time = current_time
-                
-                if not sd_mounted:
-                    print("[БЛОКИРОВКА] Попытка аварийного переподключения SD карты...")
-                    if not mount_sd():
-                        print("[ОТКАЗ] Заправка заблокирована: Локальная база данных и логи недоступны!")
-                        play_decline()
+                if len(hex_part) >= 12:
+                    card_id = "{:010d}".format(int(hex_part[4:10], 16))
+                    
+                    current_time = time.time()
+                    if card_id == last_card_id and (current_time - last_read_time < 2):
                         continue
+                    
+                    last_card_id = card_id
+                    last_read_time = current_time
+                    
+                    if not sd_mounted:
+                        print("[БЛОКИРОВКА] Попытка аварийного переподключения SD карты...")
+                        if not mount_sd():
+                            print("[ОТКАЗ] Заправка заблокирована: Локальная база данных и логи недоступны!")
+                            play_decline()
+                            continue
+                    
+                    car_num = get_allowed_user(card_id)
+                    if car_num:
+                        print("Разрешено:", car_num)
+                        relay.value(1)
+                        play_success()
+                        current_card, current_car_num = card_id, car_num
+                        flow_pulses = 0
+                        is_fueling = True
+                        last_pulse_time = time.time()
+                    else:
+                        print("Доступ запрещен!")
+                        play_decline()
+        else:
+            # Логика заправки
+            # Если прошло более 10 секунд после последнего импульса
+            if time.time() - last_pulse_time > 10:
+                relay.value(0)
+                green_led.value(1)
+                liters = flow_pulses/60
+                is_fueling = False
                 
-                car_num = get_allowed_user(card_id)
-                if car_num:
-                    print("Разрешено:", car_num)
-                    relay.value(1)
-                    play_success()
-                    current_card, current_car_num = card_id, car_num
-                    flow_pulses = 0
-                    is_fueling = True
-                    last_pulse_time = time.time()
-                else:
-                    print("Доступ запрещен!")
-                    play_decline()
-    else:
-        # Логика заправки
-        # Если прошло более 10 секунд после последнего импульса
-        if time.time() - last_pulse_time > 10:
-            relay.value(0)
-            green_led.value(1)
-            liters = flow_pulses/60
-            is_fueling = False
-            
-            if liters > 0.01:
-                log_transaction(current_card, current_car_num, liters)
-            if emergency_flag:
-                import machine
-                machine.reset()
-                emergency_flag= False
-            print("Заправка завершена. Ожидание удаления карты...")
-            time.sleep(3)
-            last_card_id = ""
-            
-            print(f"Заправка завершена. Литров: {liters:.2f}")
-            
-            start_wait = time.time()
-            while True:
+                if liters > 0.01:
+                    log_transaction(current_card, current_car_num, liters)
                 if emergency_flag:
                     import machine
                     machine.reset()
-                if uart.any():
-                    uart.read()
-                    start_wait = time.time() # Обновляем время, если считыватель "кричит"
+                    emergency_flag= False
+                print("Заправка завершена. Ожидание удаления карты...")
+                time.sleep(3)
+                last_card_id = ""
                 
-                # Если прошло 2 секунды тишины от считывателя - значит карту убрали
-                if time.time() - start_wait > 1:
-                    break
-                time.sleep(0.1)
-            
-            last_card_id = "" # Теперь можно сбросить
-            print("Карта убрана. Готов к работе.")
-            
-    time.sleep(0.1)
+                print(f"Заправка завершена. Литров: {liters:.2f}")
+                
+                start_wait = time.time()
+                while True:
+                    if emergency_flag:
+                        import machine
+                        machine.reset()
+                    if uart.any():
+                        uart.read()
+                        start_wait = time.time() # Обновляем время, если считыватель "кричит"
+                    
+                    # Если прошло 2 секунды тишины от считывателя - значит карту убрали
+                    if time.time() - start_wait > 1:
+                        break
+                    time.sleep(0.1)
+                
+                last_card_id = "" # Теперь можно сбросить
+                print("Карта убрана. Готов к работе.")
+                
+        time.sleep(0.1)
+
+if __name__ == "__main__":
+    # Вызываем обновление один раз при запуске
+    try:
+        run_ota_check()
+    except Exception as e:
+        print("Обновление не удалось:", e)
+    main()
