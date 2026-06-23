@@ -65,7 +65,8 @@ def get_web_text(url):
 
 def run_ota_check():
     print("Проверка наличия обновлений...")
-    import time
+    import time, gc
+    gc.collect()
     url = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.txt?t=" + str(time.time())
     remote_ver = get_web_text(url)
     if remote_ver is None: # Явно проверяем на None
@@ -203,17 +204,8 @@ def log_transaction(card_id, car_num, liters):
         print("Ошибка записи лога")
 
 def main():
-    print("Запуск основной программы...")
     global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card
     global sd_mounted, last_card_id, last_read_time, emergency_flag, last_press_time
-    wlan = network.WLAN(network.STA_IF)
-    if wlan.isconnected():
-        try:
-            run_ota_check()
-        except Exception as e:
-            print("Ошибка при фоновой проверке обновлений:", e)
-    
-    # 2. ОСНОВНОЙ ЦИКЛ (здесь ваш код насоса/управления)
     print("Система готова.")
     green_led.value(1)
     red_led.value(1)
@@ -273,6 +265,9 @@ def main():
                     else:
                         print("Доступ запрещен!")
                         play_decline()
+                        last_card_id = card_id
+                        last_read_time = time.time()
+                        time.sleep(0.5)
         else:
             # Логика заправки
             # Если прошло более 10 секунд после последнего импульса
