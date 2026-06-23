@@ -5,7 +5,7 @@ from ds3231 import DS3231
 from sdcard import SDCard
 import urequests
 import network, socket, ssl, gc, machine
-
+#l;dhjsgoeiruopitupouo125047498785
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 
 # --- Настройки ---
@@ -62,7 +62,43 @@ def get_web_text(url):
     except Exception as e:
         print("Ошибка сети:", e)
         return None
-
+    
+def download_file_streamed(url, target_filename):
+    import socket, ssl, gc
+    gc.collect()
+    
+    parts = url.split('/')
+    host = parts[2]
+    path = '/' + '/'.join(parts[3:])
+    
+    try:
+        s = socket.socket()
+        s.settimeout(20.0)
+        addr = socket.getaddrinfo(host, 443)[0][-1]
+        s.connect(addr)
+        s = ssl.wrap_socket(s, server_hostname=host)
+        
+        # Отправляем запрос
+        s.write(b"GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n" % (path, host))
+        
+        # Пропускаем заголовки (ищем первый \r\n\r\n)
+        header = b""
+        while b"\r\n\r\n" not in header:
+            header += s.read(1)
+            
+        # Пишем содержимое в файл
+        with open(target_filename, 'w') as f:
+            while True:
+                data = s.read(512) # Читаем мелкими частями
+                if not data: break
+                f.write(data)
+                gc.collect() # Очищаем RAM после каждого блока
+        s.close()
+        return True
+    except Exception as e:
+        print("Ошибка потоковой загрузки:", e)
+        return False
+    
 def run_ota_check():
     print("Проверка наличия обновлений...")
     import time, gc
@@ -81,32 +117,21 @@ def run_ota_check():
     if remote_ver.strip() == local_ver:
         return
 
-    print(f"Найдено обновление {remote_ver}. Скачиваю...")
-    
-    # 3. Скачиваем новый код во временный файл main.new
-    code = get_web_text(MAIN_URL)
-    
-    # Проверка: получили ли мы вообще данные?
-    if code and len(code) > 100: # 100 байт - защита от пустого ответа
-        with open('main.new', 'w') as f:
-            f.write(code)
+    if remote_ver.strip() != local_ver:
+        print(f"Найдено обновление {remote_ver}. Скачиваю...")
         
-        # 4. Безопасная подмена
-        if 'main.py' in os.listdir():
-            if 'main.old' in os.listdir():
-                os.remove('main.old') # Удаляем старый бэкап
-            os.rename('main.py', 'main.old')
-        
-        os.rename('main.new', 'main.py')
-        
-        # 5. Обновляем версию
-        with open('version.txt', 'w') as f:
-            f.write(remote_ver)
-            
-        print("Обновление успешно. Перезагрузка.")
-        machine.reset()
-    else:
-        print("Ошибка: скачанный файл пуст или поврежден.")
+        # ВЫЗОВ НОВОЙ ФУНКЦИИ
+        if download_file_streamed(MAIN_URL, 'main.new'):
+            # Если скачали успешно — делаем подмену
+            if 'main.py' in os.listdir():
+                os.rename('main.py', 'main.old')
+            os.rename('main.new', 'main.py')
+            with open('version.txt', 'w') as f:
+                f.write(remote_ver)
+            print("Обновление установлено. Перезагрузка.")
+            machine.reset()
+        else:
+            print("Ошибка при скачивании файла.")
 
 
 def emergency_reset(pin):
@@ -315,6 +340,4 @@ if __name__ == "__main__":
         run_ota_check()
     except Exception as e:
         print("Обновление не удалось:", e)
-    
-    # Запускаем основной бесконечный цикл
     main()
