@@ -5,9 +5,9 @@ from ds3231 import DS3231
 from sdcard import SDCard
 import urequests
 import network, socket, ssl, gc, machine
-
+#fjhsdkjhsjhlh
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
-
+#lskdjfj
 # --- Настройки ---
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
