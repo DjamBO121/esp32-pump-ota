@@ -7,7 +7,8 @@ import urequests
 import network, socket, ssl, gc, machine
 
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
-
+BASE_URL = 'https://script.google.com/macros/s/AKfycbzUUoEFcHtRJ12waMhrBbP7dgau4DKo_c3Yw5R-HlfIhpiik4u9wapwvzHiyoMLg3uH/exec'
+# GOOGLE_URL = 'https://script.googleusercontent.com/macros/echo?user_content_key=AUkAhnQazLELWCWXk-2zYfDNOXxtoFJ5WcquER-nzYGEzzKgBZHN3nXWhEGsUojL5Gr8SZc3Bzi3R_KZhP9PMxk1AbuBtA3vi3DKS9BHNeUQHxThcAJQnCv9ls8mjsazss5mdhljec04I3IgjRI8P3BwJLZxOwaVX9dF2axsIpWSU2SKd1emI6yJlY4jMHkKR_selycztcAVsk_8mbLTuEfKOIje_Ydb8buyaEvraDRZ-SVu6bUtuxO11-MG6Flfd6YlkL96tAXwID62mvDGx7PbLDPeIAntQw&amp;lib=MwxGDELBaMPFR-Lw3GY4T23r-Yr2zeAVp">here</A>&action=get_users'
 # --- Настройки ---
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
@@ -39,30 +40,72 @@ emergency_flag = False
 last_press_time = 0
 
 def get_web_text(url):
+    import socket, ssl, gc
     gc.collect()
-    parts = url.split('/')
-    host = parts[2]
-    path = '/' + '/'.join(parts[3:])
     
-    try:
+    # Рекурсивный подход для обработки редиректов (до 3-х раз)
+    for _ in range(3):
+        parts = url.split('/')
+        host = parts[2]
+        path = '/' + '/'.join(parts[3:])
+        
         s = socket.socket()
-        s.settimeout(10.0)
+        s.settimeout(15.0)
         addr = socket.getaddrinfo(host, 443)[0][-1]
         s.connect(addr)
         s = ssl.wrap_socket(s, server_hostname=host)
         s.write(b"GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n" % (path, host))
         
+        # Читаем заголовки
         res = b""
-        while True:
-            data = s.read(128)
-            if not data: break
-            res += data
-        s.close()
-        return res.split(b"\r\n\r\n", 1)[1].decode().strip()
-    except Exception as e:
-        print("Ошибка сети:", e)
-        return None
+        while b"\r\n\r\n" not in res:
+            res += s.read(32)
+        
+        header, body = res.split(b"\r\n\r\n", 1)
+        header_str = header.decode()
+        
+        # Если есть редирект (код 302)
+        if "302" in header_str or "301" in header_str:
+            # Ищем новый адрес в заголовке Location
+            for line in header_str.split('\r\n'):
+                if "Location:" in line:
+                    new_url = line.split("Location: ")[1].strip()
+                    # ВАЖНО: Добавляем параметры обратно, если их нет в новом URL
+                    if "action=get_users" not in new_url:
+                        new_url += "&action=get_users"
+                    url = new_url
+                    print("Редирект на:", url)
+                    s.close()
+                    break
+        else:
+            # Читаем остальное тело ответа
+            while True:
+                data = s.read(128)
+                if not data: break
+                body += data
+            s.close()
+            return body.decode().strip()
+    return None
 
+def save_to_local_db(card_id, car_num):
+    # Сначала проверяем, не существует ли уже такая запись
+    try:
+        with open('/sd/users.txt', 'r') as f:
+            lines = f.readlines()
+        
+        # Если карта уже есть в файле, ничего не делаем
+        for line in lines:
+            if card_id in line:
+                return 
+
+        # Если карты нет, дописываем её
+        with open('/sd/users.txt', 'a') as f:
+            f.write(f"{card_id},{car_num}\n")
+            
+    except OSError:
+        # Если файла еще нет, создаем его
+        with open('/sd/users.txt', 'w') as f:
+            f.write(f"{card_id},{car_num}\n")
 
 def download_file_streamed(url, target_filename):
     import socket, ssl, gc
@@ -172,13 +215,16 @@ def play_success():
     time.sleep(0.1)
     play_tone(0.1)
     green_led.value(0)
-
+    time.sleep(2)
+    green_led.value(1)
 def play_decline():
     # Один длинный сигнал ошибки
     play_tone(0.6)
     red_led.value(0)
     time.sleep(3)
     red_led.value(1)
+    time.sleep(2)
+    red_led.value(0)
 def count_pulse(p):
     global flow_pulses, last_pulse_time
     if is_fueling:
@@ -208,15 +254,29 @@ def get_allowed_user(card_id):
                 if file_id == target_id:
                     print(f"DEBUG: НАШЛИ! ID={file_id}, Машина={car_num}")
                     return car_num
-                    
-                # Печатаем для диагностики, с чем сравниваем
-                # print(f"DEBUG: Сравниваем '{target_id}' с '{file_id}'")
                 
     except Exception as e:
         print("Ошибка при чтении файла:", e)
     
     print(f"DEBUG: Карта {target_id} не найдена в базе!")
     return None
+
+def send_to_google(card_id, car_num, liters):
+    import urequests
+    ts = rtc.datetime()
+    ts_str = "{:04d}-{:02d}-{:02d}%20{:02d}:{:02d}:{:02d}".format(*ts[:3], *ts[4:7])
+    url = f"{BASE_URL}?ts={ts_str}&card={card_id}&car={car_num}&liters={liters}"
+    
+    try:
+        print("Отправка в Google Таблицу...")
+        # Используем get запрос для экономии памяти
+        response = urequests.get(url)
+        print("Ответ Google:", response.text)
+        response.close()
+        return True
+    except Exception as e:
+        print("Ошибка отправки в Google:", e)
+        return False
 
 def log_transaction(card_id, car_num, liters):
     if not sd_mounted:
@@ -228,20 +288,59 @@ def log_transaction(card_id, car_num, liters):
             f.write(f"{ts};{card_id};{car_num};{liters:.2f}\n")
     except:
         print("Ошибка записи лога")
+    if network.WLAN(network.STA_IF).isconnected():
+        send_to_google(card_id, car_num, liters)
+        
+def sync_users_from_google():
+    print("Синхронизация базы пользователей...")
+    raw_data = get_web_text(BASE_URL + "?action=get_users")
+    if not raw_data or "HTML" in raw_data or "Error" in raw_data:
+        print("Ошибка: Сервер вернул некорректные данные.")
+        return
+
+    # Обработка данных
+    lines = raw_data.strip().split('\n')
+    for line in lines:
+        parts = line.split(',')
+        
+        # Защита: проверяем, что в строке есть хотя бы ID и Машина
+        if len(parts) < 2: 
+            continue
+            
+        card_id = parts[0].strip()
+        car_num = parts[1].strip()
+        # Если статус (parts[2]) отсутствует, ставим пустую строку
+        status = parts[2].strip() if len(parts) > 2 else ""
+
+        # Если статус пустой — карта новая
+        if status == "":
+            print(f"Обнаружена новая карта {card_id}, добавляю...")
+            
+            # Сохраняем в users.txt локально
+            # ВАЖНО: сохраняем в формате ID,Машина
+            with open('/sd/users.txt', 'a') as f:
+                f.write(f"{card_id},{car_num}\n")
+            save_to_local_db(card_id, car_num)
+            
+            # Отправляем подтверждение в Google
+            confirm_url = f"{BASE_URL}?action=update_status&id={card_id}&status=Добавлено"
+            res= get_web_text(confirm_url)
+            print(f"Карта {card_id} синхронизирована.")
+            print(f"DEBUG: Ответ от Google на обновление статуса: {res}")
 
 def main():
     global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card
     global sd_mounted, last_card_id, last_read_time, emergency_flag, last_press_time
     print("Система готова.")
-    green_led.value(1)
-    red_led.value(1)
     while sd_mounted:
-        
+        green_led.value(1)
+        red_led.value(1)
         if emergency_flag:
             emergency_flag = False
             print("\n!!! АВАРИЙНЫЙ ПЕРЕХВАТ !!!")
             relay.value(0)
             green_led.value(1)
+            red_led.value(0)
             if is_fueling:
                 liters = flow_pulses / 60
                 if liters > 0.01:
@@ -336,6 +435,10 @@ def main():
         time.sleep(0.1)
 
 if __name__ == "__main__":
+    try:
+        sync_users_from_google()
+    except Exception as e:
+        print("Обновление базы данных не удалось:", e)
     try:
         run_ota_check()
     except Exception as e:
