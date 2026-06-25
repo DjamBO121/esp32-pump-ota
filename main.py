@@ -8,8 +8,7 @@ import network, socket, ssl, gc, machine
 
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 BASE_URL = 'https://script.google.com/macros/s/AKfycbzUUoEFcHtRJ12waMhrBbP7dgau4DKo_c3Yw5R-HlfIhpiik4u9wapwvzHiyoMLg3uH/exec'
-# GOOGLE_URL = 'https://script.googleusercontent.com/macros/echo?user_content_key=AUkAhnQazLELWCWXk-2zYfDNOXxtoFJ5WcquER-nzYGEzzKgBZHN3nXWhEGsUojL5Gr8SZc3Bzi3R_KZhP9PMxk1AbuBtA3vi3DKS9BHNeUQHxThcAJQnCv9ls8mjsazss5mdhljec04I3IgjRI8P3BwJLZxOwaVX9dF2axsIpWSU2SKd1emI6yJlY4jMHkKR_selycztcAVsk_8mbLTuEfKOIje_Ydb8buyaEvraDRZ-SVu6bUtuxO11-MG6Flfd6YlkL96tAXwID62mvDGx7PbLDPeIAntQw&amp;lib=MwxGDELBaMPFR-Lw3GY4T23r-Yr2zeAVp">here</A>&action=get_users'
-# --- Настройки ---
+
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
 i2c = I2C(0, scl=Pin(22), sda=Pin(21))
@@ -297,9 +296,35 @@ def sync_users_from_google():
     if not raw_data or "HTML" in raw_data or "Error" in raw_data:
         print("Ошибка: Сервер вернул некорректные данные.")
         return
-
-    # Обработка данных
+    users_to_keep = []
     lines = raw_data.strip().split('\n')
+    try:
+        with open('/sd/users.txt', 'r') as f:
+            local_lines = f.readlines()
+    except: local_lines = []
+
+    # Проходим по базе из Google
+    for line in lines:
+        parts = line.split(',')
+        if len(parts) < 3: continue
+        
+        card_id, car_num, status = parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+        # Если статус "Удалить"
+        if status == "Удалить":
+            print(f"Удаление карты {card_id}...")
+            # Отправляем в Google подтверждение "Удалено"
+            get_web_text(f"{BASE_URL}?action=update_status&id={card_id}&status=Удалено")
+            continue # Пропускаем добавление в список
+
+        # Если карта не удаляется, сохраняем для дальнейшей проверки (добавление)
+        users_to_keep.append(f"{card_id},{car_num}")
+
+    # 2. Перезаписываем файл SD только актуальными картами
+    with open('/sd/users.txt', 'w') as f:
+        for item in users_to_keep:
+            f.write(item + "\n")
+    # Обработка данных
     for line in lines:
         parts = line.split(',')
         
