@@ -1,4 +1,4 @@
-from machine import Pin, UART, I2C, SPI
+from machine import Pin, UART, I2C, SPI, WDT
 import time
 import os
 import gc
@@ -24,6 +24,7 @@ green_led = Pin(15, Pin.OUT)
 red_led = Pin(13, Pin.OUT)
 buzzer = Pin(14, Pin.OUT)
 flow_sensor = Pin(32, Pin.IN, Pin.PULL_UP)
+wdt = WDT(timeout=120000)
 
 try:
     status = i2c.readfrom_mem(0x68, 0x0F, 1)[0]
@@ -38,8 +39,6 @@ last_pulse_time = 0
 current_car_num = ""
 current_card = ""
 sd_mounted = False
-last_card_id = ""
-last_read_time = 0
 relay.value(0)
 emergency_flag = False
 last_press_time = 0
@@ -61,14 +60,13 @@ def send_to_google(card_id, car_num, liters, timestamp):
     car_enc = urlencode(car_num)
     liters_enc = urlencode(liters)
     
-    # Вырезаем хост и путь вручную из BASE_URL
     host = "script.google.com"
     path = BASE_URL.replace("https://script.google.com", "") + f"?ts={ts_enc}&card={card_enc}&car={car_enc}&liters={liters_enc}"
     
     try:
         print("DEBUG: Снайперский GET-запрос...")
         s = socket.socket()
-        s.settimeout(11.0)  # ЖЕСТКИЙ ПРЕДОХРАНИТЕЛЬ: ровно 7 секунд на всё
+        s.settimeout(10.0)
         
         addr = socket.getaddrinfo(host, 443)[0][-1]
         s.connect(addr)
@@ -77,21 +75,17 @@ def send_to_google(card_id, car_num, liters, timestamp):
         request = f"GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n"
         s.write(request.encode())
         
-        # Читаем ТОЛЬКО верхушку заголовка (первые 40 байт)
         response_head = s.read(40).decode('utf-8', 'ignore')
-        
         s.close()
         del s
         gc.collect()
         
-        # Google Apps Script при успешном приеме ВСЕГДА отвечает кодом 302
         if "302" in response_head or "200" in response_head:
             print("DEBUG: Успех! Сервер подтвердил прием.")
             return True
         else:
             print(f"DEBUG: Странный заголовок: {response_head[:25]}")
             return False
-
     except Exception as e:
         print("DEBUG: Таймаут или сбой сокета:", e)
         gc.collect()
@@ -106,7 +100,7 @@ def get_web_text(url):
         
         try:
             s = socket.socket()
-            s.settimeout(15.0)
+            s.settimeout(10.0)
             addr = socket.getaddrinfo(host, 443)[0][-1]
             s.connect(addr)
             s = ssl.wrap_socket(s, server_hostname=host)
@@ -148,7 +142,7 @@ def download_file_streamed(url, target_filename):
     
     try:
         s = socket.socket()
-        s.settimeout(20.0)
+        s.settimeout(10.0)
         addr = socket.getaddrinfo(host, 443)[0][-1]
         s.connect(addr)
         s = ssl.wrap_socket(s, server_hostname=host)
@@ -169,17 +163,6 @@ def download_file_streamed(url, target_filename):
     except Exception as e:
         print("Ошибка потоковой загрузки OTA:", e)
         return False
-
-def save_to_local_db(card_id, car_num):
-    try:
-        with open('/sd/users.txt', 'r') as f:
-            if any(card_id in line for line in f):
-                return
-        with open('/sd/users.txt', 'a') as f:
-            f.write(f"{card_id},{car_num}\n")
-    except OSError:
-        with open('/sd/users.txt', 'w') as f:
-            f.write(f"{card_id},{car_num}\n")
 
 def mount_sd():
     global sd_mounted
@@ -205,16 +188,24 @@ def play_success():
     time.sleep(0.1)
     play_tone(0.1)
     green_led.value(0)
-    time.sleep(2)
+    time.sleep(1.5)
     green_led.value(1)
 
+# ЧИСТАЯ ЛОГИКА ОТКАЗА (Без хвостов и лишних пауз)
 def play_decline():
-    play_tone(0.6)
-    red_led.value(0)
-    time.sleep(3)
-    red_led.value(1)
-    time.sleep(2)
-    red_led.value(0)
+    red_led.value(0)     # Включили красный
+    play_tone(0.6)       # Длинный гудок
+    time.sleep(2.4)      # Додержали диод включенным до 3 сек в сумме
+    red_led.value(1)     # Жестко выключили красный
+
+# ЖЕЛЕЗОБЕТОННАЯ ОЧИСТКА ЭФИРА (Ждет тишины)
+def flush_uart_completely():
+    silence_start = time.time()
+    while time.time() - silence_start < 1.5:
+        if uart.any():
+            uart.read(uart.any())  # Читаем ровно столько байт, сколько пришло
+            silence_start = time.time()  # Сбрасываем таймер тишины! Ждем заново
+        time.sleep(0.05)
 
 def emergency_reset(pin):
     global emergency_flag, last_press_time
@@ -249,60 +240,42 @@ def get_allowed_user(card_id):
     return None
 
 def sync_logs():
-    print("DEBUG: Запуск проверки очереди логов...")
     wlan = network.WLAN(network.STA_IF)
-    if not wlan.isconnected():
-        print("DEBUG: Нет Wi-Fi соединения.")
-        return
-
-    try:
-        files = os.listdir('/sd/logs')
-    except Exception:
-        return
+    if not wlan.isconnected(): return
+    try: files = os.listdir('/sd/logs')
+    except Exception: return
 
     for file in files:
         if file.endswith(".json"):
             path = f"/sd/logs/{file}"
             try:
-                with open(path, "r") as f:
-                    content = json.loads(f.read())
-                
+                with open(path, "r") as f: content = json.loads(f.read())
                 if content["status"] == "PENDING":
                     d = content["data"]
                     if send_to_google(d["card"], d["car"], d["liters"], d["ts"]):
                         os.remove(path)
                         gc.collect()
-                        print(f"DEBUG: Очередь очищена: {file} удален.")
-            except Exception as e:
-                print(f"DEBUG: Ошибка обработки файла {file}: {e}")
+            except Exception as e: print(f"Ошибка очереди {file}: {e}")
 
 def log_transaction(card_id, car_num, liters):
     if not sd_mounted: return
     t = rtc.datetime()
     ts_str = "{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}".format(*t[:3], *t[4:7])
     ts_fmt = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:3], *t[4:7])
-    
-    liters = "{:.1f}".format(liters).replace('.', ',')
+    liters_comma = "{:.1f}".format(liters).replace('.', ',')
     
     try:
         with open('/sd/log.csv', 'a') as f:
-            f.write(f"{ts_str};{card_id};{car_num};{liters}\n")
+            f.write(f"{ts_str};{card_id};{car_num};{liters_comma}\n")
     except Exception: pass
 
     try: os.mkdir('/sd/logs')
     except Exception: pass
         
     filename = f"/sd/logs/log_{ts_str}.json"
-    data = {
-    "ts": ts_fmt,
-    "card": card_id,
-    "car": car_num,
-    "liters": liters
-    }
+    data = {"ts": ts_fmt, "card": card_id, "car": car_num, "liters": liters_comma}
     with open(filename, "w") as f:
         f.write(json.dumps({"status": "PENDING", "data": data}))
-    
-    print(f"Сохранен офлайн-чек: {filename}")
     sync_logs()
 
 def run_ota_check():
@@ -310,7 +283,6 @@ def run_ota_check():
     url = f"https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/version.txt?t={time.time()}"
     remote_ver = get_web_text(url)
     if not remote_ver: return
-    
     remote_ver = remote_ver.strip()
     try:
         with open('version.txt', 'r') as f: local_ver = f.read().strip()
@@ -322,7 +294,6 @@ def run_ota_check():
             if 'main.py' in os.listdir(): os.rename('main.py', 'main.old')
             os.rename('main.new', 'main.py')
             with open('version.txt', 'w') as f: f.write(remote_ver)
-            print("Обновление применено. Перезапуск...")
             machine.reset()
 
 def sync_users_from_google():
@@ -339,53 +310,39 @@ def sync_users_from_google():
                     local_users[p[0].strip()] = p[1].strip()
     except Exception: pass
 
-    db_changed = False  # Флаг, чтобы зря не насиловать SD-карту перезаписью файлов
-
+    db_changed = False
     for line in raw.strip().split('\n'):
         parts = line.split(',')
         if len(parts) < 2: continue
         c_id, c_car = parts[0].strip(), parts[1].strip()
         c_stat = parts[2].strip() if len(parts) > 2 else ""
 
-        # РЕЖИМ 1: УДАЛЕНИЕ КАРТЫ
         if c_stat == "Удалить":
             if c_id in local_users:
                 del local_users[c_id]
                 db_changed = True
-                print(f"Карта {c_id} удалена локально.")
             get_web_text(f"{BASE_URL}?action=update_status&id={c_id}&status=Удалено")
-        
-        # РЕЖИМ 2: ИЗМЕНЕНИЕ НОМЕРА МАШИНЫ
         elif c_stat == "Изменить":
-            # Находим по ID и перезаписываем номер авто (даже если карты почему-то не было, она запишется корректно)
             local_users[c_id] = c_car
             db_changed = True
-            print(f"Карта {c_id}: изменен номер машины на {c_car}.")
             get_web_text(f"{BASE_URL}?action=update_status&id={c_id}&status=Изменено")
-        
-        # РЕЖИМ 3: ДОБАВЛЕНИЕ НОВОЙ КАРТЫ
         elif c_stat == "":
             local_users[c_id] = c_car
             db_changed = True
-            print(f"Карта {c_id}: добавлена в базу для машины {c_car}.")
             get_web_text(f"{BASE_URL}?action=update_status&id={c_id}&status=Добавлено")
 
-    # Перезаписываем локальную базу на SD-карте только если были реальные изменения
     if db_changed:
         try:
             with open('/sd/users.txt', 'w') as f:
-                for uid, ucar in local_users.items():
-                    f.write(f"{uid},{ucar}\n")
-            print("Локальный список карт на SD успешно обновлен.")
-        except Exception as e:
-            print("Критическая ошибка сохранения базы карт на SD:", e)
+                for uid, ucar in local_users.items(): f.write(f"{uid},{ucar}\n")
+        except Exception as e: print("Ошибка сохранения базы SD:", e)
 
 def main():
-    global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card
-    global last_card_id, last_read_time, emergency_flag
+    global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card, emergency_flag
     
     print("Контроллер АЗС запущен.")
     while sd_mounted:
+        wdt.feed()
         green_led.value(1)
         red_led.value(1)
         
@@ -396,30 +353,25 @@ def main():
             red_led.value(0)
             if is_fueling:
                 l = flow_pulses / 60
-                if l > 0.01:
-                    log_transaction(current_card, current_car_num, l)
+                if l > 0.01: log_transaction(current_card, current_car_num, l)
             time.sleep(0.5)
             machine.reset()
             
         if not is_fueling:
             if uart.any():
                 time.sleep(0.05)
-                data = uart.read()
-                while uart.any(): uart.read()
+                data = uart.read(uart.any()) # Читаем строго доступный объем
                 
                 data_str = data.decode('ascii', 'ignore')
                 hex_p = "".join([c for c in data_str if c in "0123456789ABCDEFabcdef"])
                 
                 if len(hex_p) >= 12:
                     card_id = "{:010d}".format(int(hex_p[4:10], 16))
-                    if card_id == last_card_id and (time.time() - last_read_time < 2): continue
-                    
-                    last_card_id = card_id
-                    last_read_time = time.time()
                     
                     if not sd_mounted:
                         if not mount_sd():
                             play_decline()
+                            flush_uart_completely()
                             continue
                     
                     car_num = get_allowed_user(card_id)
@@ -430,9 +382,10 @@ def main():
                         flow_pulses = 0
                         is_fueling = True
                         last_pulse_time = time.time()
+                        flush_uart_completely() # Сжгли остатки успешной карты
                     else:
                         play_decline()
-                        time.sleep(0.5)
+                        flush_uart_completely() # Сжгли флуд отказанной карты до упора
         else:
             if time.time() - last_pulse_time > 10:
                 relay.value(0)
@@ -440,31 +393,21 @@ def main():
                 liters = flow_pulses / 60
                 is_fueling = False
                 
-                if liters > 0.01:
-                    log_transaction(current_card, current_car_num, liters)
+                if liters > 0.01: log_transaction(current_card, current_car_num, liters)
                 if emergency_flag: machine.reset()
                 
-                print("Заправка окончена. Уберите карту...")
-                time.sleep(3)
-                start_w = time.time()
-                while True:
-                    if emergency_flag: machine.reset()
-                    if uart.any():
-                        uart.read()
-                        start_w = time.time()
-                    if time.time() - start_w > 1: break
-                    time.sleep(0.1)
-                last_card_id = ""
-        time.sleep(0.1)
+                print("Заправка окончена.")
+                flush_uart_completely()
+        time.sleep(0.05)
 
 mount_sd()
 
 if __name__ == "__main__":
     if sd_mounted:
         try: sync_logs()
-        except Exception as e: print("Сбой отправки логов:", e)
+        except Exception: pass
         try: sync_users_from_google()
-        except Exception as e: print("Сбой синхронизации карт:", e)
+        except Exception: pass
         try: run_ota_check()
-        except Exception as e: print("Сбой OTA:", e)
+        except Exception: pass
         main()
