@@ -1,74 +1,48 @@
+import network
 import os
 import machine
-import gc
-import network
-import webrepl
 import time
+from machine import WDT
 
-# Функция подключения к Wi-Fi
-def do_connect():
-    wlan = network.WLAN(network.STA_IF)
-    if wlan.isconnected():
-        print("Уже в сети:", wlan.ifconfig())
-        return
-    wlan.active(True)
-    wlan.connect('4G-MIFI-533B', '1234567890')
-    for _ in range(10):
-        if wlan.isconnected(): break
-        time.sleep(1)
-    print('Network config:', wlan.ifconfig())
+WIFI_SSID = "4G-MIFI-533B"
+WIFI_PASS = "1234567890"
+wdt = WDT(timeout=30000)
 
-# Функция для безопасного чтения версии без импорта
-def get_version():
+if 'ota_status.txt' in os.listdir():
     try:
-        with open("version.py", "r") as f:
-            content = f.read()
-            if "=" in content:
-                # Извлекаем значение после '=', убираем кавычки
-                return content.split("=")[1].replace('"', '').replace("'", "").strip()
-    except:
-        pass
-    return "0.0"
+        with open('ota_status.txt', 'r') as f:
+            status = f.read().strip()
+    except Exception:
+        status = "1"
 
-do_connect()
-webrepl.start()
+    if status == "0":
+        with open('ota_status.txt', 'w') as f:
+            f.write("1")
+            
+    elif status == "1":
+        try:
+            if 'main.py' in os.listdir(): 
+                os.remove('main.py')
+            if 'main.old' in os.listdir(): 
+                os.rename('main.old', 'main.py')
+            os.remove('ota_status.txt')
+            time.sleep(1)
+            machine.reset()
+        except Exception as e:
+            print("Ошибка файловой системы при откате:", e)
 
-FILES = os.listdir()
+wlan = network.WLAN(network.STA_IF)
+wlan.active(False)
+time.sleep(1)
+wlan.active(True)
 
-# Локальная версия прошивки на плате (читаем файл, а не импортируем)
-current_version = get_version()
-print(f"[BOOT] Текущая версия системы: {current_version}")
-
-# 1. ЗАЩИТА И ОТКАТ: Проверяем маркер «испытательного срока»
-if "purgatory.txt" in FILES:
-    print("[BOOT] ВНИМАНИЕ: Новое обновление упало!")
-    if "main.py" in FILES: os.remove("main.py")
-    if "main_backup.py" in FILES: os.rename("main_backup.py", "main.py")
-    os.remove("purgatory.txt")
-    print("[BOOT] Откат завершен. Продолжаем загрузку...")
-    machine.reset() # Перезагрузка после отката
-
-# 2. УСТАНОВКА ОБНОВЛЕНИЯ
-elif "main_new.py" in FILES:
-    print("[BOOT] Найдено свежее обновление. Подготовка...")
-    
-    # Делаем бэкап
-    if "main.py" in FILES:
-        if "main_backup.py" in FILES:
-            os.remove("main_backup.py")
-        os.rename("main.py", "main_backup.py")
-        
-    # Устанавливаем новую прошивку
-    os.rename("main_new.py", "main.py")
-    
-    # Устанавливаем новую версию
-    if "version_new.py" in FILES:
-        if "version.py" in FILES: os.remove("version.py")
-        os.rename("version_new.py", "version.py")
-        
-    # Ставим маркер
-    with open("purgatory.txt", "w") as f:
-        f.write("testing")
-        
-    print("[BOOT] Обновление установлено. Запуск в тестовом режиме...")
-    machine.reset() # Перезагрузка для применения
+try:
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    # Ждем максимум 5 секунд, чтобы не тормозить запуск main.py
+    for i in range(5):
+        if wlan.isconnected():
+            print("Wi-Fi подключен!")
+            break
+        time.sleep(1)
+except Exception as e:
+    print("Ошибка Wi-Fi в boot.py:", e)
