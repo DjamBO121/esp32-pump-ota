@@ -2,11 +2,16 @@ import network
 import os
 import machine
 import time
-from machine import WDT
+import gc
+from machine import WDT,Pin
+
+red_led = Pin(13, Pin.OUT)
+red_led.value(0)
+gc.collect()
 
 WIFI_SSID = "4G-MIFI-533B"
 WIFI_PASS = "1234567890"
-wdt = WDT(timeout=30000)
+wdt = WDT(timeout=120000)
 
 if 'ota_status.txt' in os.listdir():
     try:
