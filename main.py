@@ -1,6 +1,7 @@
 from machine import Pin, UART, I2C, SPI, WDT
 import time
 import os
+import hashlib
 import gc
 import machine
 import socket
@@ -12,7 +13,7 @@ from ds3231 import DS3231
 from sdcard import SDCard
 
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
-BASE_URL = "https://script.google.com/macros/s/AKfycbxgUXeezVTChMpPMqKrzmwuBcK_B0LPxx8yJghvgyBK_1_FrHZiK9EpyVJn-7vShRL4/exec"
+BASE_URL = "https://script.google.com/macros/s/AKfycbyJdxC35bIC7QQo1EnwblEf3DRbFL8v48REHfOSH43w4WUqI28FG3eT3umZ03UkrexK/exec"
 
 # Инициализация пинов
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
@@ -242,20 +243,36 @@ def get_allowed_user(card_id):
 def sync_logs():
     wlan = network.WLAN(network.STA_IF)
     if not wlan.isconnected(): return
-    try: files = os.listdir('/sd/logs')
-    except Exception: return
-
+    
+    files = [f for f in os.listdir('/sd/logs') if f.endswith(".json")]
     for file in files:
-        if file.endswith(".json"):
-            path = f"/sd/logs/{file}"
-            try:
-                with open(path, "r") as f: content = json.loads(f.read())
-                if content["status"] == "PENDING":
-                    d = content["data"]
-                    if send_to_google(d["card"], d["car"], d["liters"], d["ts"]):
-                        os.remove(path)
-                        gc.collect()
-            except Exception as e: print(f"Ошибка очереди {file}: {e}")
+        path = f"/sd/logs/{file}"
+        try:
+            with open(path, "r") as f: 
+                content = json.loads(f.read())
+            
+            if content.get("status") == "PENDING":
+                d = content["data"]
+                # Формируем URL
+                params = f"ts={urlencode(d['ts'])}&card={urlencode(d['card'])}&car={urlencode(d['car'])}&liters={urlencode(d['liters'])}&reqId={urlencode(d['reqId'])}"
+                path_url = BASE_URL.replace("https://script.google.com", "") + "?" + params
+                
+                # Отправляем запрос максимально просто
+                s = socket.socket()
+                s.settimeout(5.0)
+                addr = socket.getaddrinfo("script.google.com", 443)[0][-1]
+                s.connect(addr)
+                s = ssl.wrap_socket(s, server_hostname="script.google.com")
+                
+                # Отправляем и сразу закрываем, не ждем ответа (избегаем ошибки 16)
+                s.write(f"GET {path_url} HTTP/1.0\r\nHost: script.google.com\r\n\r\n".encode())
+                s.close()
+                
+                print(f"Лог отправлен: {d['reqId']}")
+                os.remove(path) # Удаляем файл, так как запрос ушел
+                gc.collect()
+        except Exception as e: 
+            print(f"Ошибка при отправке {file}: {e}")
 
 def log_transaction(card_id, car_num, liters):
     if not sd_mounted: return
@@ -263,7 +280,8 @@ def log_transaction(card_id, car_num, liters):
     ts_str = "{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}".format(*t[:3], *t[4:7])
     ts_fmt = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:3], *t[4:7])
     liters_comma = "{:.1f}".format(liters).replace('.', ',')
-    
+    req_id = f"{ts_str}_{card_id}"
+    data = {"ts": ts_fmt, "card": card_id, "car": car_num, "liters": liters_comma, "reqId": req_id}
     try:
         with open('/sd/log.csv', 'a') as f:
             f.write(f"{ts_str};{card_id};{car_num};{liters_comma}\n")
@@ -273,7 +291,6 @@ def log_transaction(card_id, car_num, liters):
     except Exception: pass
         
     filename = f"/sd/logs/log_{ts_str}.json"
-    data = {"ts": ts_fmt, "card": card_id, "car": car_num, "liters": liters_comma}
     with open(filename, "w") as f:
         f.write(json.dumps({"status": "PENDING", "data": data}))
     sync_logs()
