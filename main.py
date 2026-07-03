@@ -11,10 +11,10 @@ import urequests
 import network
 from ds3231 import DS3231
 from sdcard import SDCard
-#asdfgew
+
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 BASE_URL = "https://script.google.com/macros/s/AKfycbyJdxC35bIC7QQo1EnwblEf3DRbFL8v48REHfOSH43w4WUqI28FG3eT3umZ03UkrexK/exec"
-#sdfaasdf
+
 # Инициализация пинов
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
@@ -25,7 +25,7 @@ green_led = Pin(15, Pin.OUT)
 red_led = Pin(13, Pin.OUT)
 buzzer = Pin(14, Pin.OUT)
 flow_sensor = Pin(32, Pin.IN, Pin.PULL_UP)
-wdt = WDT(timeout=120000)
+wdt = WDT(timeout=600000)
 
 try:
     status = i2c.readfrom_mem(0x68, 0x0F, 1)[0]
@@ -94,35 +94,25 @@ def send_to_google(card_id, car_num, liters, timestamp):
 
 def get_web_text(url):
     gc.collect()
-    for attempt in range(3):
+    for _ in range(3):
         parts = url.split('/')
         host = parts[2]
         path = '/' + '/'.join(parts[3:])
         
-        s = None
         try:
             s = socket.socket()
             s.settimeout(10.0)
             addr = socket.getaddrinfo(host, 443)[0][-1]
             s.connect(addr)
             s = ssl.wrap_socket(s, server_hostname=host)
-            
-            # Собираем запрос строго через encode, чтобы не побить спецсимволы и кириллицу
-            request = "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n".format(path, host)
-            s.write(request.encode('utf-8'))
+            s.write(b"GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n" % (path, host))
             
             res = b""
             while b"\r\n\r\n" not in res:
-                chunk = s.read(32)
-                if not chunk: break
-                res += chunk
+                res += s.read(32)
             
-            if b"\r\n\r\n" not in res:
-                s.close()
-                continue
-                
             header, body = res.split(b"\r\n\r\n", 1)
-            header_str = header.decode('utf-8', 'ignore')
+            header_str = header.decode()
             
             if "302" in header_str or "301" in header_str:
                 for line in header_str.split('\r\n'):
@@ -133,22 +123,16 @@ def get_web_text(url):
                         url = new_url
                         s.close()
                         break
-                continue  # Уходим на следующую попытку, но уже с новым редирект-URL
             else:
                 while True:
                     data = s.read(128)
                     if not data: break
                     body += data
                 s.close()
-                return body.decode('utf-8', 'ignore').strip()
-                
+                return body.decode().strip()
         except Exception as e:
-            print("Ошибка чтения web-текста (Попытка {}/3): {}".format(attempt + 1, e))
-            if s:
-                try: s.close()
-                except Exception: pass
-            time.sleep(1.5)  # Обязательная пауза перед повтором, чтобы сеть «отвисла»
-            
+            print("Ошибка чтения web-текста:", e)
+            return None
     return None
 
 def download_file_streamed(url, target_filename):
@@ -348,13 +332,18 @@ def sync_users_from_google():
     db_changed = False
     successfully_processed = []
                              
-    # Шаг 1: Сначала просто обрабатываем данные в памяти
+    # Шаг 1: Обрабатываем данные в памяти
     for line in raw.strip().split('\n'):
         parts = line.split(',')
         if len(parts) < 2: continue
-        c_id, c_car = parts[0].strip(), parts[1].strip()
-        if not c_id: continue 
+        raw_id, c_car = parts[0].strip(), parts[1].strip()
+        if not raw_id: continue 
+        
+        c_id = "{:010d}".format(int(raw_id)) if raw_id.isdigit() else raw_id
+        
+        # ВОТ ЭТА ВОЗВРАЩЕННАЯ СТРОЧКА (извлекаем статус из 3-го столбца):
         c_stat = parts[2].strip() if len(parts) > 2 else ""
+        
         if c_stat == "Удалить":
             if c_id in local_users:
                 del local_users[c_id]
@@ -369,8 +358,7 @@ def sync_users_from_google():
             db_changed = True
             successfully_processed.append((c_id, "Добавлено"))
 
-    # Шаг 2: ЖЕСТКО сохраняем изменения на SD карту. 
-    # Если запись упадет, функция прервется и Гугл НЕ узнает об успехе. Всё повторится при следующем запуске.
+    # Шаг 2: Записываем чистую базу на SD карту
     if db_changed:
         try:
             with open('/sd/users.txt', 'w') as f:
@@ -378,16 +366,14 @@ def sync_users_from_google():
                     f.write("{},{}\n".format(uid, ucar))
         except Exception as e: 
             print("КРИТИЧЕСКАЯ ОШИБКА: Не удалось записать базу на SD:", e)
-            return  # Завершаем работу, данные на физическом носителе важнее!
+            return
 
-    # Шаг 3: И только когда файлы сохранены, аккуратно, по очереди, уведомляем Гугл
+    # Шаг 3: Уведомляем Гугл
     for c_id, status_to_set in successfully_processed:
-        enc_status = urlencode(status_to_set) # Кодируем "Добавлено"/"Удалено" в %XX формат
-        print("Отправка статуса в Google: {} -> {}".format(c_id, status_to_set))
-        
-        gc.collect() # Чистим ОЗУ перед каждым тяжелым SSL-запросом
+        enc_status = urlencode(status_to_set)
+        gc.collect()
         get_web_text("{}?action=update_status&id={}&status={}".format(BASE_URL, c_id, enc_status))
-        time.sleep(0.5) # Даем сетевому стеку ESP32 выдохнуть между запросами
+        time.sleep(0.5)
 
 def main():
     global is_fueling, flow_pulses, last_pulse_time, current_car_num, current_card, emergency_flag
