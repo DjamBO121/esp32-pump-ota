@@ -12,6 +12,8 @@ import network
 from ds3231 import DS3231
 from sdcard import SDCard
 
+K = 60
+
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 BASE_URL = "https://script.google.com/macros/s/AKfycbyJdxC35bIC7QQo1EnwblEf3DRbFL8v48REHfOSH43w4WUqI28FG3eT3umZ03UkrexK/exec"
 
@@ -390,7 +392,7 @@ def main():
             green_led.value(1)
             red_led.value(0)
             if is_fueling:
-                l = flow_pulses / 60
+                l = flow_pulses / K
                 if l > 0.01: log_transaction(current_card, current_car_num, l)
             time.sleep(0.5)
             machine.reset()
@@ -428,7 +430,7 @@ def main():
             if time.time() - last_pulse_time > 10:
                 relay.value(0)
                 green_led.value(1)
-                liters = flow_pulses / 60
+                liters = flow_pulses / K
                 is_fueling = False
                 
                 if liters > 0.01: log_transaction(current_card, current_car_num, liters)
@@ -449,3 +451,4 @@ if __name__ == "__main__":
         try: run_ota_check()
         except Exception: pass
         main()
+
