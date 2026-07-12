@@ -12,7 +12,7 @@ import network
 from ds3231 import DS3231
 from sdcard import SDCard
 
-K = 60
+K = 75
 
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 BASE_URL = "https://script.google.com/macros/s/AKfycbyJdxC35bIC7QQo1EnwblEf3DRbFL8v48REHfOSH43w4WUqI28FG3eT3umZ03UkrexK/exec"
