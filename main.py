@@ -21,7 +21,6 @@ OWN_VERSION = "1"
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 BASE_URL = "https://script.google.com/macros/s/AKfycbyJdxC35bIC7QQo1EnwblEf3DRbFL8v48REHfOSH43w4WUqI28FG3eT3umZ03UkrexK/exec"
 
-# Заполните после создания бота через @BotFather и получения chat_id.
 TELEGRAM_TOKEN = "8935980075:AAGFAyhdvbCJfVzRWCE1lLbx_p2i6GEcARs"
 TELEGRAM_CHAT_ID = "1838704527"
 
@@ -37,9 +36,16 @@ buzzer = Pin(14, Pin.OUT)
 flow_sensor = Pin(32, Pin.IN, Pin.PULL_UP)
 wdt = WDT(timeout=600000)
 
+# OSF (Oscillator Stop Flag, бит 0x80 регистра 0x0F) - чип сам ставит
+# этот бит, если генератор останавливался (сел резервный элемент питания,
+# полное обесточивание и т.п.) - то есть время в RTC недостоверно.
+RTC_OSF_NOW = False
 try:
     status = i2c.readfrom_mem(0x68, 0x0F, 1)[0]
-    i2c.writeto_mem(0x68, 0x0F, bytes([status & 0x7F]))
+    RTC_OSF_NOW = bool(status & 0x80)
+    i2c.writeto_mem(0x68, 0x0F, bytes([status & 0x7F]))  # сбрасываем бит в самом чипе
+    if RTC_OSF_NOW:
+        print("RTC: обнаружен сброс времени (OSF) - потребуется синхронизация по интернету.")
 except Exception as e:
     print("Ошибка сброса флага RTC:", e)
 
@@ -103,6 +109,120 @@ def send_telegram(text):
         print("Telegram: ошибка отправки:", e)
         gc.collect()
         return False
+
+_HTTP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+def _parse_http_date(s):
+    # Пример строки заголовка Date: "Wed, 10 Sep 2025 12:34:56 GMT"
+    try:
+        _, rest = s.split(',', 1)
+        day_str, mon_str, year_str, time_str, _tz = rest.strip().split(' ')
+        day = int(day_str)
+        month = _HTTP_MONTHS.index(mon_str) + 1
+        year = int(year_str)
+        hh, mm, ss = [int(x) for x in time_str.split(':')]
+        return (year, month, day, hh, mm, ss)
+    except Exception as e:
+        print("Не удалось разобрать дату из HTTP-заголовка:", s, e)
+        return None
+
+def get_internet_time_utc():
+    """Достаёт текущее время (UTC) из заголовка Date HTTPS-ответа.
+    Специально НЕ используется NTP (UDP-порт 123) - в этом проекте уже
+    проверенно работает только HTTPS/443, поэтому время берём оттуда же,
+    без нового сетевого пути."""
+    host = "api.telegram.org"
+    try:
+        s = socket.socket()
+        s.settimeout(10.0)
+        addr = socket.getaddrinfo(host, 443)[0][-1]
+        s.connect(addr)
+        s = ssl.wrap_socket(s, server_hostname=host)
+        s.write(b"HEAD / HTTP/1.0\r\nHost: %s\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n" % host)
+
+        head = b""
+        while b"\r\n\r\n" not in head and len(head) < 1024:
+            chunk = s.read(64)
+            if not chunk: break
+            head += chunk
+        s.close()
+        del s
+        gc.collect()
+
+        for line in head.decode('utf-8', 'ignore').split('\r\n'):
+            if line.lower().startswith('date:'):
+                return _parse_http_date(line.split(':', 1)[1].strip())
+    except Exception as e:
+        print("Не удалось получить время из интернета:", e)
+        gc.collect()
+    return None
+
+def sync_rtc_time_if_needed():
+    """Если при старте обнаружен сброс RTC (OSF) - или синхронизация не
+    удалась в прошлый раз - берёт текущее время из интернета и пишет в
+    DS3231 по екатеринбургскому времени (UTC+5, круглый год - в России
+    нет перехода на летнее/зимнее время с 2014 года). Использует
+    отдельный файл-маркер, а не только сам бит OSF, чтобы не потерять
+    необходимость синхронизации, если в момент сброса не было сети -
+    попытка повторится на следующей загрузке."""
+    marker = 'rtc_needs_sync.txt'
+    needs_sync = RTC_OSF_NOW or (marker in os.listdir())
+    if not needs_sync:
+        return
+
+    if marker not in os.listdir():
+        try:
+            with open(marker, 'w') as f:
+                f.write('1')
+        except Exception:
+            pass
+
+    wlan = network.WLAN(network.STA_IF)
+    for _ in range(10):
+        if wlan.isconnected():
+            break
+        wdt.feed()
+        time.sleep(1)
+
+    if not wlan.isconnected():
+        print("RTC: нет сети, синхронизация времени отложена до следующей загрузки.")
+        return
+
+    utc = get_internet_time_utc()
+    if utc is None:
+        print("RTC: не удалось получить время из интернета, попробуем при следующей загрузке.")
+        return
+
+    year, month, day, hh, mm, ss = utc
+    if year < 2024 or year > 2099:
+        print("RTC: полученное время выглядит неправдоподобно, синхронизация отменена:", utc)
+        return
+
+    # UTC -> Екатеринбург (UTC+5). weekday/yearday в mktime игнорируются,
+    # поэтому передаем нули - localtime потом вычислит их сам.
+    epoch_utc = time.mktime((year, month, day, hh, mm, ss, 0, 0))
+    epoch_ekb = epoch_utc + 5 * 3600
+    y, mo, d, h, mi, se, wd, _yd = time.localtime(epoch_ekb)
+
+    try:
+        # ВНИМАНИЕ: порядок полей здесь (год, месяц, день, день_недели,
+        # час, минута, секунда) взят из того, как в этом же файле уже
+        # ЧИТАЕТСЯ rtc.datetime() (см. log_transaction: t[:3] и t[4:7]).
+        # Если ваш ds3231.py ожидает другой порядок аргументов для ЗАПИСИ -
+        # поправьте эту строку под него, я не видел исходник драйвера.
+        rtc.datetime((y, mo, d, wd, h, mi, se, 0))
+    except Exception as e:
+        print("RTC: не удалось записать время в модуль:", e)
+        return  # маркер не удаляем - попробуем снова при следующей загрузке
+
+    try:
+        os.remove(marker)
+    except Exception:
+        pass
+
+    msg = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(y, mo, d, h, mi, se)
+    print("RTC: время синхронизировано по интернету (Екатеринбург):", msg)
+    send_telegram("АЗС: обнаружен сброс времени на RTC-модуле. Установлено текущее время (Екатеринбург): {}".format(msg))
 
 def send_to_google(card_id, car_num, liters, timestamp):
     gc.collect()
@@ -562,6 +682,11 @@ def main():
         time.sleep(0.05)
 
 mount_sd()
+
+try:
+    sync_rtc_time_if_needed()
+except Exception as e:
+    print("Ошибка синхронизации RTC:", e)
 
 if __name__ == "__main__":
     if sd_mounted:
