@@ -21,9 +21,6 @@ OWN_VERSION = "1"
 MAIN_URL = "https://raw.githubusercontent.com/DjamBO121/esp32-pump-ota/refs/heads/main/main.py"
 BASE_URL = "https://script.google.com/macros/s/AKfycbyJdxC35bIC7QQo1EnwblEf3DRbFL8v48REHfOSH43w4WUqI28FG3eT3umZ03UkrexK/exec"
 
-TELEGRAM_TOKEN = "8935980075:AAGFAyhdvbCJfVzRWCE1lLbx_p2i6GEcARs"
-TELEGRAM_CHAT_ID = "1838704527"
-
 # Инициализация пинов
 reset_btn = Pin(4, Pin.IN, Pin.PULL_UP)
 uart = UART(2, baudrate=9600, tx=17, rx=16)
@@ -70,46 +67,6 @@ def urlencode(s):
                 result += "%{:02X}".format(b)
     return result
 
-def send_telegram(text):
-    """Best-effort отправка сообщения в Telegram через сырой сокет
-    (без urequests, чтобы не тратить лишнюю RAM). Никогда не бросает
-    исключение наружу - вызывающий код просто получает True/False."""
-    if not TELEGRAM_TOKEN or "PUT_YOUR" in TELEGRAM_TOKEN:
-        print("Telegram: токен не настроен, уведомление не отправлено.")
-        return False
-
-    gc.collect()
-    host = "api.telegram.org"
-    path = "/bot{}/sendMessage?chat_id={}&text={}".format(
-        TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, urlencode(text)
-    )
-
-    try:
-        s = socket.socket()
-        s.settimeout(10.0)
-        addr = socket.getaddrinfo(host, 443)[0][-1]
-        s.connect(addr)
-        s = ssl.wrap_socket(s, server_hostname=host)
-
-        request = "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n".format(path, host)
-        s.write(request.encode())
-
-        head = s.read(40)
-        s.close()
-        del s
-        gc.collect()
-
-        if head and b"200" in head:
-            print("Telegram: сообщение отправлено.")
-            return True
-
-        print("Telegram: неожиданный ответ сервера:", head)
-        return False
-    except Exception as e:
-        print("Telegram: ошибка отправки:", e)
-        gc.collect()
-        return False
-
 _HTTP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 def _parse_http_date(s):
@@ -130,8 +87,10 @@ def get_internet_time_utc():
     """Достаёт текущее время (UTC) из заголовка Date HTTPS-ответа.
     Специально НЕ используется NTP (UDP-порт 123) - в этом проекте уже
     проверенно работает только HTTPS/443, поэтому время берём оттуда же,
-    без нового сетевого пути."""
-    host = "api.telegram.org"
+    без нового сетевого пути. Хост - тот же script.google.com, что и
+    остальной бэкенд, чтобы не заводить лишнюю зависимость от стороннего
+    сервиса только ради заголовка Date."""
+    host = "script.google.com"
     try:
         s = socket.socket()
         s.settimeout(10.0)
@@ -222,7 +181,6 @@ def sync_rtc_time_if_needed():
 
     msg = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(y, mo, d, h, mi, se)
     print("RTC: время синхронизировано по интернету (Екатеринбург):", msg)
-    send_telegram("АЗС: обнаружен сброс времени на RTC-модуле. Установлено текущее время (Екатеринбург): {}".format(msg))
 
 def send_to_google(card_id, car_num, liters, timestamp):
     gc.collect()
@@ -503,21 +461,21 @@ def run_ota_check():
         # (нетронутый) boot.py уже умеет по этому флагу откатиться на
         # main.old, если новая прошивка не доживет до check_ota_state().
         with open('ota_status.txt', 'w') as f: f.write("0")
-        send_telegram("Обновление АЗС: {} -> {}. Перезагрузка...".format(local_ver, remote_ver))
         machine.reset()
 
 def check_ota_state():
     """Вызывается один раз при старте, до входа в main(). Определяет,
-    что произошло с последним OTA-обновлением, и публикует статус в
-    Telegram. Работает целиком силами main.py, без изменений в boot.py:
+    что произошло с последним OTA-обновлением. Работает целиком силами
+    main.py, без изменений в boot.py:
 
     - ota_status.txt еще существует -> это первая успешная загрузка
       после обновления (boot.py файл не удалил, значит откат не
-      случился). Удаляем флаг, подтверждая прошивку, и шлем "успешно".
+      случился). Удаляем флаг, подтверждая прошивку.
     - ota_status.txt уже нет, но version.txt на диске не совпадает с
       OWN_VERSION, зашитой в этот файл -> значит boot.py только что
       откатил main.py на main.old (предыдущую версию), а version.txt
-      остался от неудачной попытки. Чиним version.txt и шлем "откат".
+      остался от неудачной попытки. Чиним version.txt и заносим неудачную
+      версию в черный список (см. run_ota_check), чтобы не качать её снова.
     - иначе - обычная загрузка без изменений, ничего не делаем.
     """
     pending = 'ota_status.txt' in os.listdir()
@@ -534,12 +492,8 @@ def check_ota_state():
         except Exception as e:
             print("Не удалось удалить ota_status.txt:", e)
             return
-        # Берем версию из version.txt (её только что записал run_ota_check
-        # на этом же устройстве) - она надежнее, чем OWN_VERSION, на случай
-        # если вы забыли поднять OWN_VERSION в самом файле при релизе.
         confirmed_ver = recorded_ver if recorded_ver is not None else OWN_VERSION
         print(f"Прошивка версии {confirmed_ver} подтверждена как рабочая.")
-        send_telegram("АЗС обновлена и работает. Версия: {}".format(confirmed_ver))
     elif recorded_ver is not None and recorded_ver != OWN_VERSION:
         try:
             with open('version.txt', 'w') as f:
@@ -552,9 +506,6 @@ def check_ota_state():
         except Exception as e:
             print("Не удалось записать ota_blacklist.txt:", e)
         print(f"Обнаружен автооткат: версия {recorded_ver} не запустилась, сейчас работает {OWN_VERSION}.")
-        send_telegram(
-            "АЗС: автоматический откат! Версия {} не запустилась, сейчас работает версия {}.".format(recorded_ver, OWN_VERSION)
-        )
 
 def sync_users_from_google():
     print("Обновление белого списка карт...")
